@@ -1,0 +1,56 @@
+From 6d3d1a9c542b19dff1c7d7c8354d0869e4655287 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 16 Dec 2013 14:12:09 -0800
+Subject: [PATCH 015435/122806] bcache: bugfix for race between moving_gc and
+ bucket_invalidate
+
+There is a possibility for a bucket to be invalidated by the allocator
+while moving_gc was copying it's contents to another bucket, if the
+bucket only held cached data. To prevent this moving checks for
+a stale ptr (to an invalidated bucket), before and after reads.
+It it finds one, it simply ignores moving that data. This only
+affects bcache if the moving_gc was turned on, note that it's
+off by default.
+
+Signed-off-by: Nicholas Swenson <nks@daterainc.com>
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/movinggc.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/md/bcache/movinggc.c b/drivers/md/bcache/movinggc.c
+index 30f347d..f2f0998 100644
+--- a/drivers/md/bcache/movinggc.c
++++ b/drivers/md/bcache/movinggc.c
+@@ -64,11 +64,16 @@ static void write_moving_finish(struct closure *cl)
+ 
+ static void read_moving_endio(struct bio *bio, int error)
+ {
++	struct bbio *b = container_of(bio, struct bbio, bio);
+ 	struct moving_io *io = container_of(bio->bi_private,
+ 					    struct moving_io, cl);
+ 
+ 	if (error)
+ 		io->op.error = error;
++	else if (!KEY_DIRTY(&b->key) &&
++		 ptr_stale(io->op.c, &b->key, 0)) {
++		io->op.error = -EINTR;
++	}
+ 
+ 	bch_bbio_endio(io->op.c, bio, error, "reading data to move");
+ }
+@@ -140,6 +145,11 @@ static void read_moving(struct cache_set *c)
+ 		if (!w)
+ 			break;
+ 
++		if (ptr_stale(c, &w->key, 0)) {
++			bch_keybuf_del(&c->moving_gc_keys, w);
++			continue;
++		}
++
+ 		io = kzalloc(sizeof(struct moving_io) + sizeof(struct bio_vec)
+ 			     * DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS),
+ 			     GFP_KERNEL);
+-- 
+2.6.2
+

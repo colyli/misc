@@ -1,0 +1,28 @@
+From a664d0f05a2ec02c8f042db536d84d15d6e19e81 Mon Sep 17 00:00:00 2001
+From: Slava Pestov <sp@daterainc.com>
+Date: Tue, 20 May 2014 12:20:28 -0700
+Subject: [PATCH 060625/122806] bcache: fix crash on shutdown in passthrough
+ mode
+
+We never started the writeback thread in this case, so don't stop it.
+---
+ drivers/md/bcache/super.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 09573c2..6ceaec3 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1071,7 +1071,8 @@ static void cached_dev_free(struct closure *cl)
+ 	struct cached_dev *dc = container_of(cl, struct cached_dev, disk.cl);
+ 
+ 	cancel_delayed_work_sync(&dc->writeback_rate_update);
+-	kthread_stop(dc->writeback_thread);
++	if (!IS_ERR_OR_NULL(dc->writeback_thread))
++		kthread_stop(dc->writeback_thread);
+ 
+ 	mutex_lock(&bch_register_lock);
+ 
+-- 
+2.6.2
+

@@ -1,0 +1,1425 @@
+From a85e968e66a175c86d0410719ea84a5bd0f1d070 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Fri, 20 Dec 2013 17:28:16 -0800
+Subject: [PATCH 019181/122806] bcache: Add struct btree_keys
+
+Soon, bset.c won't need to depend on struct btree.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h    |   2 +-
+ drivers/md/bcache/bset.c      | 179 +++++++++++++++++++++++++-----------------
+ drivers/md/bcache/bset.h      | 119 ++++++++++++++++++++++++++--
+ drivers/md/bcache/btree.c     | 153 +++++++++++++++++-------------------
+ drivers/md/bcache/btree.h     |  93 ++--------------------
+ drivers/md/bcache/debug.c     |  18 ++---
+ drivers/md/bcache/extents.c   |  19 +++--
+ drivers/md/bcache/sysfs.c     |   2 +-
+ include/trace/events/bcache.h |   2 +-
+ 9 files changed, 323 insertions(+), 264 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 5c74d55..93b8484 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -679,9 +679,9 @@ struct cache_set {
+ 	unsigned		error_decay;
+ 
+ 	unsigned short		journal_delay_ms;
++	bool			expensive_debug_checks;
+ 	unsigned		verify:1;
+ 	unsigned		key_merging_disabled:1;
+-	unsigned		expensive_debug_checks:1;
+ 	unsigned		gc_always_rewrite:1;
+ 	unsigned		shrinker_disabled:1;
+ 	unsigned		copy_gc_enabled:1;
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index c2c42cb..f34ef56 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -149,33 +149,33 @@ struct bkey_float {
+ #define BSET_CACHELINE		128
+ 
+ /* Space required for the btree node keys */
+-static inline size_t btree_keys_bytes(struct btree *b)
++static inline size_t btree_keys_bytes(struct btree_keys *b)
+ {
+ 	return PAGE_SIZE << b->page_order;
+ }
+ 
+-static inline size_t btree_keys_cachelines(struct btree *b)
++static inline size_t btree_keys_cachelines(struct btree_keys *b)
+ {
+ 	return btree_keys_bytes(b) / BSET_CACHELINE;
+ }
+ 
+ /* Space required for the auxiliary search trees */
+-static inline size_t bset_tree_bytes(struct btree *b)
++static inline size_t bset_tree_bytes(struct btree_keys *b)
+ {
+ 	return btree_keys_cachelines(b) * sizeof(struct bkey_float);
+ }
+ 
+ /* Space required for the prev pointers */
+-static inline size_t bset_prev_bytes(struct btree *b)
++static inline size_t bset_prev_bytes(struct btree_keys *b)
+ {
+ 	return btree_keys_cachelines(b) * sizeof(uint8_t);
+ }
+ 
+ /* Memory allocation */
+ 
+-void bch_btree_keys_free(struct btree *b)
++void bch_btree_keys_free(struct btree_keys *b)
+ {
+-	struct bset_tree *t = b->sets;
++	struct bset_tree *t = b->set;
+ 
+ 	if (bset_prev_bytes(b) < PAGE_SIZE)
+ 		kfree(t->prev);
+@@ -195,10 +195,11 @@ void bch_btree_keys_free(struct btree *b)
+ 	t->tree = NULL;
+ 	t->data = NULL;
+ }
++EXPORT_SYMBOL(bch_btree_keys_free);
+ 
+-int bch_btree_keys_alloc(struct btree *b, unsigned page_order, gfp_t gfp)
++int bch_btree_keys_alloc(struct btree_keys *b, unsigned page_order, gfp_t gfp)
+ {
+-	struct bset_tree *t = b->sets;
++	struct bset_tree *t = b->set;
+ 
+ 	BUG_ON(t->data);
+ 
+@@ -225,6 +226,29 @@ err:
+ 	bch_btree_keys_free(b);
+ 	return -ENOMEM;
+ }
++EXPORT_SYMBOL(bch_btree_keys_alloc);
++
++void bch_btree_keys_init(struct btree_keys *b, const struct btree_keys_ops *ops,
++			 bool *expensive_debug_checks)
++{
++	unsigned i;
++
++	b->ops = ops;
++	b->expensive_debug_checks = expensive_debug_checks;
++	b->nsets = 0;
++	b->last_set_unwritten = 0;
++
++	/* XXX: shouldn't be needed */
++	for (i = 0; i < MAX_BSETS; i++)
++		b->set[i].size = 0;
++	/*
++	 * Second loop starts at 1 because b->keys[0]->data is the memory we
++	 * allocated
++	 */
++	for (i = 1; i < MAX_BSETS; i++)
++		b->set[i].data = NULL;
++}
++EXPORT_SYMBOL(bch_btree_keys_init);
+ 
+ /* Binary tree stuff for auxiliary search trees */
+ 
+@@ -448,9 +472,9 @@ static void make_bfloat(struct bset_tree *t, unsigned j)
+ 		f->exponent = 127;
+ }
+ 
+-static void bset_alloc_tree(struct btree *b, struct bset_tree *t)
++static void bset_alloc_tree(struct btree_keys *b, struct bset_tree *t)
+ {
+-	if (t != b->sets) {
++	if (t != b->set) {
+ 		unsigned j = roundup(t[-1].size,
+ 				     64 / sizeof(struct bkey_float));
+ 
+@@ -458,27 +482,30 @@ static void bset_alloc_tree(struct btree *b, struct bset_tree *t)
+ 		t->prev = t[-1].prev + j;
+ 	}
+ 
+-	while (t < b->sets + MAX_BSETS)
++	while (t < b->set + MAX_BSETS)
+ 		t++->size = 0;
+ }
+ 
+-static void bch_bset_build_unwritten_tree(struct btree *b)
++static void bch_bset_build_unwritten_tree(struct btree_keys *b)
+ {
+ 	struct bset_tree *t = bset_tree_last(b);
+ 
++	BUG_ON(b->last_set_unwritten);
++	b->last_set_unwritten = 1;
++
+ 	bset_alloc_tree(b, t);
+ 
+-	if (t->tree != b->sets->tree + btree_keys_cachelines(b)) {
++	if (t->tree != b->set->tree + btree_keys_cachelines(b)) {
+ 		t->prev[0] = bkey_to_cacheline_offset(t->data->start);
+ 		t->size = 1;
+ 	}
+ }
+ 
+-void bch_bset_init_next(struct btree *b, struct bset *i, uint64_t magic)
++void bch_bset_init_next(struct btree_keys *b, struct bset *i, uint64_t magic)
+ {
+-	if (i != b->sets->data) {
+-		b->sets[++b->nsets].data = i;
+-		i->seq = b->sets->data->seq;
++	if (i != b->set->data) {
++		b->set[++b->nsets].data = i;
++		i->seq = b->set->data->seq;
+ 	} else
+ 		get_random_bytes(&i->seq, sizeof(uint64_t));
+ 
+@@ -488,18 +515,21 @@ void bch_bset_init_next(struct btree *b, struct bset *i, uint64_t magic)
+ 
+ 	bch_bset_build_unwritten_tree(b);
+ }
++EXPORT_SYMBOL(bch_bset_init_next);
+ 
+-static void bset_build_written_tree(struct btree *b)
++void bch_bset_build_written_tree(struct btree_keys *b)
+ {
+ 	struct bset_tree *t = bset_tree_last(b);
+ 	struct bkey *k = t->data->start;
+ 	unsigned j, cacheline = 1;
+ 
++	b->last_set_unwritten = 0;
++
+ 	bset_alloc_tree(b, t);
+ 
+ 	t->size = min_t(unsigned,
+ 			bkey_to_cacheline(t, bset_bkey_last(t->data)),
+-			b->sets->tree + btree_keys_cachelines(b) - t->tree);
++			b->set->tree + btree_keys_cachelines(b) - t->tree);
+ 
+ 	if (t->size < 2) {
+ 		t->size = 0;
+@@ -532,13 +562,14 @@ static void bset_build_written_tree(struct btree *b)
+ 	     j = inorder_next(j, t->size))
+ 		make_bfloat(t, j);
+ }
++EXPORT_SYMBOL(bch_bset_build_written_tree);
+ 
+-void bch_bset_fix_invalidated_key(struct btree *b, struct bkey *k)
++void bch_bset_fix_invalidated_key(struct btree_keys *b, struct bkey *k)
+ {
+ 	struct bset_tree *t;
+ 	unsigned inorder, j = 1;
+ 
+-	for (t = b->sets; t <= bset_tree_last(b); t++)
++	for (t = b->set; t <= bset_tree_last(b); t++)
+ 		if (k < bset_bkey_last(t->data))
+ 			goto found_set;
+ 
+@@ -577,8 +608,9 @@ fix_right:	do {
+ 			j = j * 2 + 1;
+ 		} while (j < t->size);
+ }
++EXPORT_SYMBOL(bch_bset_fix_invalidated_key);
+ 
+-static void bch_bset_fix_lookup_table(struct btree *b,
++static void bch_bset_fix_lookup_table(struct btree_keys *b,
+ 				      struct bset_tree *t,
+ 				      struct bkey *k)
+ {
+@@ -613,7 +645,7 @@ static void bch_bset_fix_lookup_table(struct btree *b,
+ 		}
+ 	}
+ 
+-	if (t->size == b->sets->tree + btree_keys_cachelines(b) - t->tree)
++	if (t->size == b->set->tree + btree_keys_cachelines(b) - t->tree)
+ 		return;
+ 
+ 	/* Possibly add a new entry to the end of the lookup table */
+@@ -627,12 +659,12 @@ static void bch_bset_fix_lookup_table(struct btree *b,
+ 		}
+ }
+ 
+-void bch_bset_insert(struct btree *b, struct bkey *where,
++void bch_bset_insert(struct btree_keys *b, struct bkey *where,
+ 		     struct bkey *insert)
+ {
+ 	struct bset_tree *t = bset_tree_last(b);
+ 
+-	BUG_ON(t->data != write_block(b));
++	BUG_ON(!b->last_set_unwritten);
+ 	BUG_ON(bset_byte_offset(b, t->data) +
+ 	       __set_bytes(t->data, t->data->keys + bkey_u64s(insert)) >
+ 	       PAGE_SIZE << b->page_order);
+@@ -645,20 +677,17 @@ void bch_bset_insert(struct btree *b, struct bkey *where,
+ 	bkey_copy(where, insert);
+ 	bch_bset_fix_lookup_table(b, t, where);
+ }
++EXPORT_SYMBOL(bch_bset_insert);
+ 
+ struct bset_search_iter {
+ 	struct bkey *l, *r;
+ };
+ 
+-static struct bset_search_iter bset_search_write_set(struct btree *b,
+-						     struct bset_tree *t,
++static struct bset_search_iter bset_search_write_set(struct bset_tree *t,
+ 						     const struct bkey *search)
+ {
+ 	unsigned li = 0, ri = t->size;
+ 
+-	BUG_ON(!b->nsets &&
+-	       t->size < bkey_to_cacheline(t, bset_bkey_last(t->data)));
+-
+ 	while (li + 1 != ri) {
+ 		unsigned m = (li + ri) >> 1;
+ 
+@@ -674,8 +703,7 @@ static struct bset_search_iter bset_search_write_set(struct btree *b,
+ 	};
+ }
+ 
+-static struct bset_search_iter bset_search_tree(struct btree *b,
+-						struct bset_tree *t,
++static struct bset_search_iter bset_search_tree(struct bset_tree *t,
+ 						const struct bkey *search)
+ {
+ 	struct bkey *l, *r;
+@@ -759,7 +787,7 @@ struct bkey *__bch_bset_search(struct btree *b, struct bset_tree *t,
+ 	if (unlikely(!t->size)) {
+ 		i.l = t->data->start;
+ 		i.r = bset_bkey_last(t->data);
+-	} else if (bset_written(b, t)) {
++	} else if (bset_written(&b->keys, t)) {
+ 		/*
+ 		 * Each node in the auxiliary search tree covers a certain range
+ 		 * of bits, and keys above and below the set it covers might
+@@ -773,12 +801,16 @@ struct bkey *__bch_bset_search(struct btree *b, struct bset_tree *t,
+ 		if (unlikely(bkey_cmp(search, t->data->start) < 0))
+ 			return t->data->start;
+ 
+-		i = bset_search_tree(b, t, search);
+-	} else
+-		i = bset_search_write_set(b, t, search);
++		i = bset_search_tree(t, search);
++	} else {
++		BUG_ON(!b->keys.nsets &&
++		       t->size < bkey_to_cacheline(t, bset_bkey_last(t->data)));
++
++		i = bset_search_write_set(t, search);
++	}
+ 
+ 	if (expensive_debug_checks(b->c)) {
+-		BUG_ON(bset_written(b, t) &&
++		BUG_ON(bset_written(&b->keys, t) &&
+ 		       i.l != t->data->start &&
+ 		       bkey_cmp(tree_to_prev_bkey(t,
+ 			  inorder_to_tree(bkey_to_cacheline(t, i.l), t)),
+@@ -794,6 +826,7 @@ struct bkey *__bch_bset_search(struct btree *b, struct bset_tree *t,
+ 
+ 	return i.l;
+ }
++EXPORT_SYMBOL(__bch_bset_search);
+ 
+ /* Btree iterator */
+ 
+@@ -833,7 +866,7 @@ static struct bkey *__bch_btree_iter_init(struct btree *b,
+ 	iter->b = b;
+ #endif
+ 
+-	for (; start <= &b->sets[b->nsets]; start++) {
++	for (; start <= bset_tree_last(&b->keys); start++) {
+ 		ret = bch_bset_search(b, start, search);
+ 		bch_btree_iter_push(iter, ret, bset_bkey_last(start->data));
+ 	}
+@@ -845,8 +878,9 @@ struct bkey *bch_btree_iter_init(struct btree *b,
+ 				 struct btree_iter *iter,
+ 				 struct bkey *search)
+ {
+-	return __bch_btree_iter_init(b, iter, search, b->sets);
++	return __bch_btree_iter_init(b, iter, search, b->keys.set);
+ }
++EXPORT_SYMBOL(bch_btree_iter_init);
+ 
+ static inline struct bkey *__bch_btree_iter_next(struct btree_iter *iter,
+ 						 btree_iter_cmp_fn *cmp)
+@@ -879,9 +913,10 @@ struct bkey *bch_btree_iter_next(struct btree_iter *iter)
+ 	return __bch_btree_iter_next(iter, btree_iter_cmp);
+ 
+ }
++EXPORT_SYMBOL(bch_btree_iter_next);
+ 
+ struct bkey *bch_btree_iter_next_filter(struct btree_iter *iter,
+-					struct btree *b, ptr_filter_fn fn)
++					struct btree_keys *b, ptr_filter_fn fn)
+ {
+ 	struct bkey *ret;
+ 
+@@ -913,15 +948,16 @@ int bch_bset_sort_state_init(struct bset_sort_state *state, unsigned page_order)
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL(bch_bset_sort_state_init);
+ 
+-static void btree_mergesort(struct btree *b, struct bset *out,
++static void btree_mergesort(struct btree_keys *b, struct bset *out,
+ 			    struct btree_iter *iter,
+ 			    bool fixup, bool remove_stale)
+ {
+ 	int i;
+ 	struct bkey *k, *last = NULL;
+ 	BKEY_PADDED(k) tmp;
+-	bool (*bad)(struct btree *, const struct bkey *) = remove_stale
++	bool (*bad)(struct btree_keys *, const struct bkey *) = remove_stale
+ 		? bch_ptr_bad
+ 		: bch_ptr_invalid;
+ 
+@@ -955,7 +991,7 @@ static void btree_mergesort(struct btree *b, struct bset *out,
+ 	pr_debug("sorted %i keys", out->keys);
+ }
+ 
+-static void __btree_sort(struct btree *b, struct btree_iter *iter,
++static void __btree_sort(struct btree_keys *b, struct btree_iter *iter,
+ 			 unsigned start, unsigned order, bool fixup,
+ 			 struct bset_sort_state *state)
+ {
+@@ -968,7 +1004,7 @@ static void __btree_sort(struct btree *b, struct btree_iter *iter,
+ 
+ 		out = page_address(mempool_alloc(state->pool, GFP_NOIO));
+ 		used_mempool = true;
+-		order = ilog2(bucket_pages(b->c));
++		order = state->page_order;
+ 	}
+ 
+ 	start_time = local_clock();
+@@ -983,13 +1019,13 @@ static void __btree_sort(struct btree *b, struct btree_iter *iter,
+ 		 * memcpy()
+ 		 */
+ 
+-		out->magic	= bset_magic(&b->c->sb);
+-		out->seq	= b->sets[0].data->seq;
+-		out->version	= b->sets[0].data->version;
+-		swap(out, b->sets[0].data);
++		out->magic	= b->set->data->magic;
++		out->seq	= b->set->data->seq;
++		out->version	= b->set->data->version;
++		swap(out, b->set->data);
+ 	} else {
+-		b->sets[start].data->keys = out->keys;
+-		memcpy(b->sets[start].data->start, out->start,
++		b->set[start].data->keys = out->keys;
++		memcpy(b->set[start].data->start, out->start,
+ 		       (void *) bset_bkey_last(out) - (void *) out->start);
+ 	}
+ 
+@@ -998,7 +1034,7 @@ static void __btree_sort(struct btree *b, struct btree_iter *iter,
+ 	else
+ 		free_pages((unsigned long) out, order);
+ 
+-	bset_build_written_tree(b);
++	bch_bset_build_written_tree(b);
+ 
+ 	if (!start)
+ 		bch_time_stats_update(&state->time, start_time);
+@@ -1007,34 +1043,32 @@ static void __btree_sort(struct btree *b, struct btree_iter *iter,
+ void bch_btree_sort_partial(struct btree *b, unsigned start,
+ 			    struct bset_sort_state *state)
+ {
+-	size_t order = b->page_order, keys = 0;
++	size_t order = b->keys.page_order, keys = 0;
+ 	struct btree_iter iter;
+ 	int oldsize = bch_count_data(b);
+ 
+-	__bch_btree_iter_init(b, &iter, NULL, &b->sets[start]);
+-
+-	BUG_ON(!bset_written(b, bset_tree_last(b)) &&
+-	       (bset_tree_last(b)->size || b->nsets));
++	__bch_btree_iter_init(b, &iter, NULL, &b->keys.set[start]);
+ 
+ 	if (start) {
+ 		unsigned i;
+ 
+-		for (i = start; i <= b->nsets; i++)
+-			keys += b->sets[i].data->keys;
++		for (i = start; i <= b->keys.nsets; i++)
++			keys += b->keys.set[i].data->keys;
+ 
+-		order = roundup_pow_of_two(__set_bytes(b->sets->data,
++		order = roundup_pow_of_two(__set_bytes(b->keys.set->data,
+ 						       keys)) / PAGE_SIZE;
+ 		if (order)
+ 			order = ilog2(order);
+ 	}
+ 
+-	__btree_sort(b, &iter, start, order, false, state);
++	__btree_sort(&b->keys, &iter, start, order, false, state);
+ 
+ 	EBUG_ON(b->written && oldsize >= 0 && bch_count_data(b) != oldsize);
+ }
+ EXPORT_SYMBOL(bch_btree_sort_partial);
+ 
+-void bch_btree_sort_and_fix_extents(struct btree *b, struct btree_iter *iter,
++void bch_btree_sort_and_fix_extents(struct btree_keys *b,
++				    struct btree_iter *iter,
+ 				    struct bset_sort_state *state)
+ {
+ 	__btree_sort(b, iter, 0, b->page_order, true, state);
+@@ -1048,11 +1082,11 @@ void bch_btree_sort_into(struct btree *b, struct btree *new,
+ 	struct btree_iter iter;
+ 	bch_btree_iter_init(b, &iter, NULL);
+ 
+-	btree_mergesort(b, new->sets->data, &iter, false, true);
++	btree_mergesort(&b->keys, new->keys.set->data, &iter, false, true);
+ 
+ 	bch_time_stats_update(&state->time, start_time);
+ 
+-	new->sets->size = 0;
++	new->keys.set->size = 0; // XXX: why?
+ }
+ 
+ #define SORT_CRIT	(4096 / sizeof(uint64_t))
+@@ -1062,28 +1096,31 @@ void bch_btree_sort_lazy(struct btree *b, struct bset_sort_state *state)
+ 	unsigned crit = SORT_CRIT;
+ 	int i;
+ 
++	b->keys.last_set_unwritten = 0;
++
+ 	/* Don't sort if nothing to do */
+-	if (!b->nsets)
++	if (!b->keys.nsets)
+ 		goto out;
+ 
+-	for (i = b->nsets - 1; i >= 0; --i) {
++	for (i = b->keys.nsets - 1; i >= 0; --i) {
+ 		crit *= state->crit_factor;
+ 
+-		if (b->sets[i].data->keys < crit) {
++		if (b->keys.set[i].data->keys < crit) {
+ 			bch_btree_sort_partial(b, i, state);
+ 			return;
+ 		}
+ 	}
+ 
+ 	/* Sort if we'd overflow */
+-	if (b->nsets + 1 == MAX_BSETS) {
++	if (b->keys.nsets + 1 == MAX_BSETS) {
+ 		bch_btree_sort(b, state);
+ 		return;
+ 	}
+ 
+ out:
+-	bset_build_written_tree(b);
++	bch_bset_build_written_tree(&b->keys);
+ }
++EXPORT_SYMBOL(bch_btree_sort_lazy);
+ 
+ /* Sysfs stuff */
+ 
+@@ -1102,12 +1139,12 @@ static int btree_bset_stats(struct btree_op *op, struct btree *b)
+ 
+ 	stats->nodes++;
+ 
+-	for (i = 0; i <= b->nsets; i++) {
+-		struct bset_tree *t = &b->sets[i];
++	for (i = 0; i <= b->keys.nsets; i++) {
++		struct bset_tree *t = &b->keys.set[i];
+ 		size_t bytes = t->data->keys * sizeof(uint64_t);
+ 		size_t j;
+ 
+-		if (bset_written(b, t)) {
++		if (bset_written(&b->keys, t)) {
+ 			stats->sets_written++;
+ 			stats->bytes_written += bytes;
+ 
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index b579712..87da828 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -145,6 +145,9 @@
+  */
+ 
+ struct btree;
++struct btree_keys;
++struct btree_iter;
++struct btree_iter_set;
+ struct bkey_float;
+ 
+ #define MAX_BSETS		4U
+@@ -181,6 +184,74 @@ struct bset_tree {
+ 	struct bset		*data;
+ };
+ 
++struct btree_keys_ops {
++	bool		(*sort_cmp)(struct btree_iter_set,
++				    struct btree_iter_set);
++	struct bkey	*(*sort_fixup)(struct btree_iter *, struct bkey *);
++	bool		(*key_invalid)(struct btree_keys *,
++				       const struct bkey *);
++	bool		(*key_bad)(struct btree_keys *, const struct bkey *);
++	bool		(*key_merge)(struct btree_keys *,
++				     struct bkey *, struct bkey *);
++
++	/*
++	 * Only used for deciding whether to use START_KEY(k) or just the key
++	 * itself in a couple places
++	 */
++	bool		is_extents;
++};
++
++struct btree_keys {
++	const struct btree_keys_ops	*ops;
++	uint8_t			page_order;
++	uint8_t			nsets;
++	unsigned		last_set_unwritten:1;
++	bool			*expensive_debug_checks;
++
++	/*
++	 * Sets of sorted keys - the real btree node - plus a binary search tree
++	 *
++	 * set[0] is special; set[0]->tree, set[0]->prev and set[0]->data point
++	 * to the memory we have allocated for this btree node. Additionally,
++	 * set[0]->data points to the entire btree node as it exists on disk.
++	 */
++	struct bset_tree	set[MAX_BSETS];
++};
++
++static inline struct bset_tree *bset_tree_last(struct btree_keys *b)
++{
++	return b->set + b->nsets;
++}
++
++static inline bool bset_written(struct btree_keys *b, struct bset_tree *t)
++{
++	return t <= b->set + b->nsets - b->last_set_unwritten;
++}
++
++static inline bool bkey_written(struct btree_keys *b, struct bkey *k)
++{
++	return !b->last_set_unwritten || k < b->set[b->nsets].data->start;
++}
++
++static inline unsigned bset_byte_offset(struct btree_keys *b, struct bset *i)
++{
++	return ((size_t) i) - ((size_t) b->set->data);
++}
++
++static inline unsigned bset_sector_offset(struct btree_keys *b, struct bset *i)
++{
++	return bset_byte_offset(b, i) >> 9;
++}
++
++static inline bool btree_keys_expensive_checks(struct btree_keys *b)
++{
++#ifdef CONFIG_BCACHE_DEBUG
++	return *b->expensive_debug_checks;
++#else
++	return false;
++#endif
++}
++
+ #define __set_bytes(i, k)	(sizeof(*(i)) + (k) * sizeof(uint64_t))
+ #define set_bytes(i)		__set_bytes(i, i->keys)
+ 
+@@ -189,12 +260,34 @@ struct bset_tree {
+ #define set_blocks(i, block_bytes)				\
+ 	__set_blocks(i, (i)->keys, block_bytes)
+ 
+-void bch_btree_keys_free(struct btree *);
+-int bch_btree_keys_alloc(struct btree *, unsigned, gfp_t);
++static inline struct bset *bset_next_set(struct btree_keys *b,
++					 unsigned block_bytes)
++{
++	struct bset *i = bset_tree_last(b)->data;
++
++	return ((void *) i) + roundup(set_bytes(i), block_bytes);
++}
++
++void bch_btree_keys_free(struct btree_keys *);
++int bch_btree_keys_alloc(struct btree_keys *, unsigned, gfp_t);
++void bch_btree_keys_init(struct btree_keys *, const struct btree_keys_ops *,
++			 bool *);
+ 
+-void bch_bset_fix_invalidated_key(struct btree *, struct bkey *);
+-void bch_bset_init_next(struct btree *, struct bset *, uint64_t);
+-void bch_bset_insert(struct btree *, struct bkey *, struct bkey *);
++void bch_bset_init_next(struct btree_keys *, struct bset *, uint64_t);
++void bch_bset_build_written_tree(struct btree_keys *);
++void bch_bset_fix_invalidated_key(struct btree_keys *, struct bkey *);
++void bch_bset_insert(struct btree_keys *, struct bkey *, struct bkey *);
++
++/*
++ * Tries to merge l and r: l should be lower than r
++ * Returns true if we were able to merge. If we did merge, l will be the merged
++ * key, r will be untouched.
++ */
++static inline bool bch_bkey_try_merge(struct btree_keys *b,
++				      struct bkey *l, struct bkey *r)
++{
++	return b->ops->key_merge ?  b->ops->key_merge(b, l, r) : false;
++}
+ 
+ /* Btree key iteration */
+ 
+@@ -208,11 +301,11 @@ struct btree_iter {
+ 	} data[MAX_BSETS];
+ };
+ 
+-typedef bool (*ptr_filter_fn)(struct btree *, const struct bkey *);
++typedef bool (*ptr_filter_fn)(struct btree_keys *, const struct bkey *);
+ 
+ struct bkey *bch_btree_iter_next(struct btree_iter *);
+ struct bkey *bch_btree_iter_next_filter(struct btree_iter *,
+-					struct btree *, ptr_filter_fn);
++					struct btree_keys *, ptr_filter_fn);
+ 
+ void bch_btree_iter_push(struct btree_iter *, struct bkey *, struct bkey *);
+ struct bkey *bch_btree_iter_init(struct btree *, struct btree_iter *,
+@@ -246,7 +339,7 @@ int bch_bset_sort_state_init(struct bset_sort_state *, unsigned);
+ void bch_btree_sort_lazy(struct btree *, struct bset_sort_state *);
+ void bch_btree_sort_into(struct btree *, struct btree *,
+ 			 struct bset_sort_state *);
+-void bch_btree_sort_and_fix_extents(struct btree *, struct btree_iter *,
++void bch_btree_sort_and_fix_extents(struct btree_keys *, struct btree_iter *,
+ 				    struct bset_sort_state *);
+ void bch_btree_sort_partial(struct btree *, unsigned,
+ 			    struct bset_sort_state *);
+@@ -311,6 +404,16 @@ static inline bool bch_cut_back(const struct bkey *where, struct bkey *k)
+ 	_ret;							\
+ })
+ 
++static inline bool bch_ptr_invalid(struct btree_keys *b, const struct bkey *k)
++{
++	return b->ops->key_invalid(b, k);
++}
++
++static inline bool bch_ptr_bad(struct btree_keys *b, const struct bkey *k)
++{
++	return b->ops->key_bad(b, k);
++}
++
+ /* Keylists */
+ 
+ struct keylist {
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 6734e27..5d7dee8 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -107,14 +107,6 @@ enum {
+ 
+ static struct workqueue_struct *btree_io_wq;
+ 
+-static inline bool should_split(struct btree *b)
+-{
+-	struct bset *i = write_block(b);
+-	return b->written >= btree_blocks(b) ||
+-		(b->written + __set_blocks(i, i->keys + 15, block_bytes(b->c))
+-		 > btree_blocks(b));
+-}
+-
+ #define insert_lock(s, b)	((b)->level <= (s)->lock)
+ 
+ /*
+@@ -182,6 +174,19 @@ static inline bool should_split(struct btree *b)
+ 	_r;								\
+ })
+ 
++static inline struct bset *write_block(struct btree *b)
++{
++	return ((void *) btree_bset_first(b)) + b->written * block_bytes(b->c);
++}
++
++static inline bool should_split(struct btree *b)
++{
++	struct bset *i = write_block(b);
++	return b->written >= btree_blocks(b) ||
++		(b->written + __set_blocks(i, i->keys + 15, block_bytes(b->c))
++		 > btree_blocks(b));
++}
++
+ /* Btree key manipulation */
+ 
+ void bkey_put(struct cache_set *c, struct bkey *k)
+@@ -222,7 +227,7 @@ void bch_btree_node_read_done(struct btree *b)
+ 		goto err;
+ 
+ 	for (;
+-	     b->written < btree_blocks(b) && i->seq == b->sets[0].data->seq;
++	     b->written < btree_blocks(b) && i->seq == b->keys.set[0].data->seq;
+ 	     i = write_block(b)) {
+ 		err = "unsupported bset version";
+ 		if (i->version > BCACHE_BSET_VERSION)
+@@ -250,7 +255,7 @@ void bch_btree_node_read_done(struct btree *b)
+ 		}
+ 
+ 		err = "empty set";
+-		if (i != b->sets[0].data && !i->keys)
++		if (i != b->keys.set[0].data && !i->keys)
+ 			goto err;
+ 
+ 		bch_btree_iter_push(iter, i->start, bset_bkey_last(i));
+@@ -260,21 +265,22 @@ void bch_btree_node_read_done(struct btree *b)
+ 
+ 	err = "corrupted btree";
+ 	for (i = write_block(b);
+-	     bset_sector_offset(b, i) < KEY_SIZE(&b->key);
++	     bset_sector_offset(&b->keys, i) < KEY_SIZE(&b->key);
+ 	     i = ((void *) i) + block_bytes(b->c))
+-		if (i->seq == b->sets[0].data->seq)
++		if (i->seq == b->keys.set[0].data->seq)
+ 			goto err;
+ 
+-	bch_btree_sort_and_fix_extents(b, iter, &b->c->sort);
++	bch_btree_sort_and_fix_extents(&b->keys, iter, &b->c->sort);
+ 
+-	i = b->sets[0].data;
++	i = b->keys.set[0].data;
+ 	err = "short btree key";
+-	if (b->sets[0].size &&
+-	    bkey_cmp(&b->key, &b->sets[0].end) < 0)
++	if (b->keys.set[0].size &&
++	    bkey_cmp(&b->key, &b->keys.set[0].end) < 0)
+ 		goto err;
+ 
+ 	if (b->written < btree_blocks(b))
+-		bch_bset_init_next(b, write_block(b), bset_magic(&b->c->sb));
++		bch_bset_init_next(&b->keys, write_block(b),
++				   bset_magic(&b->c->sb));
+ out:
+ 	mempool_free(iter, b->c->fill_iter);
+ 	return;
+@@ -308,7 +314,7 @@ static void bch_btree_node_read(struct btree *b)
+ 	bio->bi_end_io	= btree_node_read_endio;
+ 	bio->bi_private	= &cl;
+ 
+-	bch_bio_map(bio, b->sets[0].data);
++	bch_bio_map(bio, b->keys.set[0].data);
+ 
+ 	bch_submit_bbio(bio, b->c, &b->key, 0);
+ 	closure_sync(&cl);
+@@ -427,7 +433,7 @@ static void do_btree_node_write(struct btree *b)
+ 
+ 	bkey_copy(&k.key, &b->key);
+ 	SET_PTR_OFFSET(&k.key, 0, PTR_OFFSET(&k.key, 0) +
+-		       bset_sector_offset(b, i));
++		       bset_sector_offset(&b->keys, i));
+ 
+ 	if (!bio_alloc_pages(b->bio, GFP_NOIO)) {
+ 		int j;
+@@ -475,12 +481,13 @@ void bch_btree_node_write(struct btree *b, struct closure *parent)
+ 
+ 	do_btree_node_write(b);
+ 
+-	b->written += set_blocks(i, block_bytes(b->c));
+ 	atomic_long_add(set_blocks(i, block_bytes(b->c)) * b->c->sb.block_size,
+ 			&PTR_CACHE(b->c, &b->key, 0)->btree_sectors_written);
+ 
++	b->written += set_blocks(i, block_bytes(b->c));
++
+ 	/* If not a leaf node, always sort */
+-	if (b->level && b->nsets)
++	if (b->level && b->keys.nsets)
+ 		bch_btree_sort(b, &b->c->sort);
+ 	else
+ 		bch_btree_sort_lazy(b, &b->c->sort);
+@@ -489,11 +496,12 @@ void bch_btree_node_write(struct btree *b, struct closure *parent)
+ 	 * do verify if there was more than one set initially (i.e. we did a
+ 	 * sort) and we sorted down to a single set:
+ 	 */
+-	if (i != b->sets->data && !b->nsets)
++	if (i != b->keys.set->data && !b->keys.nsets)
+ 		bch_btree_verify(b);
+ 
+ 	if (b->written < btree_blocks(b))
+-		bch_bset_init_next(b, write_block(b), bset_magic(&b->c->sb));
++		bch_bset_init_next(&b->keys, write_block(b),
++				   bset_magic(&b->c->sb));
+ }
+ 
+ static void bch_btree_node_write_sync(struct btree *b)
+@@ -553,24 +561,6 @@ static void bch_btree_leaf_dirty(struct btree *b, atomic_t *journal_ref)
+  * mca -> memory cache
+  */
+ 
+-static void mca_reinit(struct btree *b)
+-{
+-	unsigned i;
+-
+-	b->flags	= 0;
+-	b->written	= 0;
+-	b->nsets	= 0;
+-
+-	for (i = 0; i < MAX_BSETS; i++)
+-		b->sets[i].size = 0;
+-	/*
+-	 * Second loop starts at 1 because b->sets[0]->data is the memory we
+-	 * allocated
+-	 */
+-	for (i = 1; i < MAX_BSETS; i++)
+-		b->sets[i].data = NULL;
+-}
+-
+ #define mca_reserve(c)	(((c->root && c->root->level)		\
+ 			  ? c->root->level : 1) * 8 + 16)
+ #define mca_can_free(c)						\
+@@ -580,7 +570,7 @@ static void mca_data_free(struct btree *b)
+ {
+ 	BUG_ON(b->io_mutex.count != 1);
+ 
+-	bch_btree_keys_free(b);
++	bch_btree_keys_free(&b->keys);
+ 
+ 	b->c->bucket_cache_used--;
+ 	list_move(&b->list, &b->c->btree_cache_freed);
+@@ -602,7 +592,7 @@ static unsigned btree_order(struct bkey *k)
+ 
+ static void mca_data_alloc(struct btree *b, struct bkey *k, gfp_t gfp)
+ {
+-	if (!bch_btree_keys_alloc(b,
++	if (!bch_btree_keys_alloc(&b->keys,
+ 				  max_t(unsigned,
+ 					ilog2(b->c->btree_pages),
+ 					btree_order(k)),
+@@ -642,9 +632,9 @@ static int mca_reap(struct btree *b, unsigned min_order, bool flush)
+ 	if (!down_write_trylock(&b->lock))
+ 		return -ENOMEM;
+ 
+-	BUG_ON(btree_node_dirty(b) && !b->sets[0].data);
++	BUG_ON(btree_node_dirty(b) && !b->keys.set[0].data);
+ 
+-	if (b->page_order < min_order)
++	if (b->keys.page_order < min_order)
+ 		goto out_unlock;
+ 
+ 	if (!flush) {
+@@ -809,7 +799,7 @@ int bch_btree_cache_alloc(struct cache_set *c)
+ 	c->verify_data = mca_bucket_alloc(c, &ZERO_KEY, GFP_KERNEL);
+ 
+ 	if (c->verify_data &&
+-	    c->verify_data->sets[0].data)
++	    c->verify_data->keys.set->data)
+ 		list_del_init(&c->verify_data->list);
+ 	else
+ 		c->verify_data = NULL;
+@@ -907,7 +897,7 @@ static struct btree *mca_alloc(struct cache_set *c, struct bkey *k, int level)
+ 	list_for_each_entry(b, &c->btree_cache_freed, list)
+ 		if (!mca_reap(b, 0, false)) {
+ 			mca_data_alloc(b, k, __GFP_NOWARN|GFP_NOIO);
+-			if (!b->sets[0].data)
++			if (!b->keys.set[0].data)
+ 				goto err;
+ 			else
+ 				goto out;
+@@ -918,7 +908,7 @@ static struct btree *mca_alloc(struct cache_set *c, struct bkey *k, int level)
+ 		goto err;
+ 
+ 	BUG_ON(!down_write_trylock(&b->lock));
+-	if (!b->sets->data)
++	if (!b->keys.set->data)
+ 		goto err;
+ out:
+ 	BUG_ON(b->io_mutex.count != 1);
+@@ -929,15 +919,17 @@ out:
+ 	hlist_add_head_rcu(&b->hash, mca_hash(c, k));
+ 
+ 	lock_set_subclass(&b->lock.dep_map, level + 1, _THIS_IP_);
+-	b->level	= level;
+ 	b->parent	= (void *) ~0UL;
++	b->flags	= 0;
++	b->written	= 0;
++	b->level	= level;
+ 
+ 	if (!b->level)
+-		b->ops	= &bch_extent_keys_ops;
++		bch_btree_keys_init(&b->keys, &bch_extent_keys_ops,
++				    &b->c->expensive_debug_checks);
+ 	else
+-		b->ops	= &bch_btree_keys_ops;
+-
+-	mca_reinit(b);
++		bch_btree_keys_init(&b->keys, &bch_btree_keys_ops,
++				    &b->c->expensive_debug_checks);
+ 
+ 	return b;
+ err:
+@@ -998,13 +990,13 @@ retry:
+ 
+ 	b->accessed = 1;
+ 
+-	for (; i <= b->nsets && b->sets[i].size; i++) {
+-		prefetch(b->sets[i].tree);
+-		prefetch(b->sets[i].data);
++	for (; i <= b->keys.nsets && b->keys.set[i].size; i++) {
++		prefetch(b->keys.set[i].tree);
++		prefetch(b->keys.set[i].data);
+ 	}
+ 
+-	for (; i <= b->nsets; i++)
+-		prefetch(b->sets[i].data);
++	for (; i <= b->keys.nsets; i++)
++		prefetch(b->keys.set[i].data);
+ 
+ 	if (btree_node_io_error(b)) {
+ 		rw_unlock(write, b);
+@@ -1084,7 +1076,7 @@ retry:
+ 	}
+ 
+ 	b->accessed = 1;
+-	bch_bset_init_next(b, b->sets->data, bset_magic(&b->c->sb));
++	bch_bset_init_next(&b->keys, b->keys.set->data, bset_magic(&b->c->sb));
+ 
+ 	mutex_unlock(&c->bucket_lock);
+ 
+@@ -1215,7 +1207,7 @@ static bool btree_gc_mark_node(struct btree *b, struct gc_stat *gc)
+ 		stale = max(stale, btree_mark_key(b, k));
+ 		keys++;
+ 
+-		if (bch_ptr_bad(b, k))
++		if (bch_ptr_bad(&b->keys, k))
+ 			continue;
+ 
+ 		gc->key_bytes += bkey_u64s(k);
+@@ -1225,9 +1217,9 @@ static bool btree_gc_mark_node(struct btree *b, struct gc_stat *gc)
+ 		gc->data += KEY_SIZE(k);
+ 	}
+ 
+-	for (t = b->sets; t <= &b->sets[b->nsets]; t++)
++	for (t = b->keys.set; t <= &b->keys.set[b->keys.nsets]; t++)
+ 		btree_bug_on(t->size &&
+-			     bset_written(b, t) &&
++			     bset_written(&b->keys, t) &&
+ 			     bkey_cmp(&b->key, &t->end) < 0,
+ 			     b, "found short btree key in gc");
+ 
+@@ -1271,7 +1263,7 @@ static int btree_gc_coalesce(struct btree *b, struct btree_op *op,
+ 	blocks = btree_default_blocks(b->c) * 2 / 3;
+ 
+ 	if (nodes < 2 ||
+-	    __set_blocks(b->sets[0].data, keys,
++	    __set_blocks(b->keys.set[0].data, keys,
+ 			 block_bytes(b->c)) > blocks * (nodes - 1))
+ 		return 0;
+ 
+@@ -1428,7 +1420,7 @@ static int btree_gc_recurse(struct btree *b, struct btree_op *op,
+ 		r[i].b = ERR_PTR(-EINTR);
+ 
+ 	while (1) {
+-		k = bch_btree_iter_next_filter(&iter, b, bch_ptr_bad);
++		k = bch_btree_iter_next_filter(&iter, &b->keys, bch_ptr_bad);
+ 		if (k) {
+ 			r->b = bch_btree_node_get(b->c, k, b->level - 1, true);
+ 			if (IS_ERR(r->b)) {
+@@ -1764,7 +1756,8 @@ static int bch_btree_check_recurse(struct btree *b, struct btree_op *op,
+ 		bch_btree_iter_init(b, &iter, NULL);
+ 
+ 		do {
+-			k = bch_btree_iter_next_filter(&iter, b, bch_ptr_bad);
++			k = bch_btree_iter_next_filter(&iter, &b->keys,
++						       bch_ptr_bad);
+ 			if (k)
+ 				btree_node_prefetch(b->c, k, b->level - 1);
+ 
+@@ -1894,7 +1887,7 @@ static bool fix_overlapping_extents(struct btree *b, struct bkey *insert,
+ 
+ 			subtract_dirty(k, KEY_START(insert), KEY_SIZE(insert));
+ 
+-			if (bkey_written(b, k)) {
++			if (bkey_written(&b->keys, k)) {
+ 				/*
+ 				 * We insert a new key to cover the top of the
+ 				 * old key, and the old key is modified in place
+@@ -1907,19 +1900,20 @@ static bool fix_overlapping_extents(struct btree *b, struct bkey *insert,
+ 				 * depends on us inserting a new key for the top
+ 				 * here.
+ 				 */
+-				top = bch_bset_search(b, bset_tree_last(b),
++				top = bch_bset_search(b,
++						      bset_tree_last(&b->keys),
+ 						      insert);
+-				bch_bset_insert(b, top, k);
++				bch_bset_insert(&b->keys, top, k);
+ 			} else {
+ 				BKEY_PADDED(key) temp;
+ 				bkey_copy(&temp.key, k);
+-				bch_bset_insert(b, k, &temp.key);
++				bch_bset_insert(&b->keys, k, &temp.key);
+ 				top = bkey_next(k);
+ 			}
+ 
+ 			bch_cut_front(insert, top);
+ 			bch_cut_back(&START_KEY(insert), k);
+-			bch_bset_fix_invalidated_key(b, k);
++			bch_bset_fix_invalidated_key(&b->keys, k);
+ 			return false;
+ 		}
+ 
+@@ -1929,7 +1923,7 @@ static bool fix_overlapping_extents(struct btree *b, struct bkey *insert,
+ 			if (bkey_cmp(&START_KEY(insert), &START_KEY(k)) > 0)
+ 				old_offset = KEY_START(insert);
+ 
+-			if (bkey_written(b, k) &&
++			if (bkey_written(&b->keys, k) &&
+ 			    bkey_cmp(&START_KEY(insert), &START_KEY(k)) <= 0) {
+ 				/*
+ 				 * Completely overwrote, so we don't have to
+@@ -1938,7 +1932,7 @@ static bool fix_overlapping_extents(struct btree *b, struct bkey *insert,
+ 				bch_cut_front(k, k);
+ 			} else {
+ 				__bch_cut_back(&START_KEY(insert), k);
+-				bch_bset_fix_invalidated_key(b, k);
++				bch_bset_fix_invalidated_key(&b->keys, k);
+ 			}
+ 		}
+ 
+@@ -1979,7 +1973,8 @@ static bool btree_insert_key(struct btree *b, struct btree_op *op,
+ 		 * the previous key.
+ 		 */
+ 		prev = NULL;
+-		m = bch_btree_iter_init(b, &iter, PRECEDING_KEY(&START_KEY(k)));
++		m = bch_btree_iter_init(b, &iter,
++					PRECEDING_KEY(&START_KEY(k)));
+ 
+ 		if (fix_overlapping_extents(b, k, &iter, replace_key)) {
+ 			op->insert_collision = true;
+@@ -2000,7 +1995,7 @@ static bool btree_insert_key(struct btree *b, struct btree_op *op,
+ 		/* prev is in the tree, if we merge we're done */
+ 		status = BTREE_INSERT_STATUS_BACK_MERGE;
+ 		if (prev &&
+-		    bch_bkey_try_merge(b, prev, k))
++		    bch_bkey_try_merge(&b->keys, prev, k))
+ 			goto merged;
+ 
+ 		status = BTREE_INSERT_STATUS_OVERWROTE;
+@@ -2010,14 +2005,14 @@ static bool btree_insert_key(struct btree *b, struct btree_op *op,
+ 
+ 		status = BTREE_INSERT_STATUS_FRONT_MERGE;
+ 		if (m != bset_bkey_last(i) &&
+-		    bch_bkey_try_merge(b, k, m))
++		    bch_bkey_try_merge(&b->keys, k, m))
+ 			goto copy;
+ 	} else {
+ 		BUG_ON(replace_key);
+-		m = bch_bset_search(b, bset_tree_last(b), k);
++		m = bch_bset_search(b, bset_tree_last(&b->keys), k);
+ 	}
+ 
+-insert:	bch_bset_insert(b, m, k);
++insert:	bch_bset_insert(&b->keys, m, k);
+ copy:	bkey_copy(m, k);
+ merged:
+ 	bch_check_keys(b, "%u for %s", status,
+@@ -2362,7 +2357,7 @@ static int bch_btree_map_nodes_recurse(struct btree *b, struct btree_op *op,
+ 
+ 		bch_btree_iter_init(b, &iter, from);
+ 
+-		while ((k = bch_btree_iter_next_filter(&iter, b,
++		while ((k = bch_btree_iter_next_filter(&iter, &b->keys,
+ 						       bch_ptr_bad))) {
+ 			ret = btree(map_nodes_recurse, k, b,
+ 				    op, from, fn, flags);
+@@ -2395,7 +2390,7 @@ static int bch_btree_map_keys_recurse(struct btree *b, struct btree_op *op,
+ 
+ 	bch_btree_iter_init(b, &iter, from);
+ 
+-	while ((k = bch_btree_iter_next_filter(&iter, b, bch_ptr_bad))) {
++	while ((k = bch_btree_iter_next_filter(&iter, &b->keys, bch_ptr_bad))) {
+ 		ret = !b->level
+ 			? fn(op, b, k)
+ 			: btree(map_keys_recurse, k, b, op, from, fn, flags);
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 0b43607..04e81f8 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -113,28 +113,7 @@ struct btree_write {
+ 	int			prio_blocked;
+ };
+ 
+-struct btree_keys_ops {
+-	bool			(*sort_cmp)(struct btree_iter_set,
+-					    struct btree_iter_set);
+-	struct bkey		*(*sort_fixup)(struct btree_iter *,
+-					       struct bkey *);
+-	bool			(*key_invalid)(struct btree *,
+-					       const struct bkey *);
+-	bool			(*key_bad)(struct btree *,
+-					   const struct bkey *);
+-	bool			(*key_merge)(struct btree *,
+-					     struct bkey *, struct bkey *);
+-
+-
+-	/*
+-	 * Only used for deciding whether to use START_KEY(k) or just the key
+-	 * itself in a couple places
+-	 */
+-	bool		is_extents;
+-};
+-
+ struct btree {
+-	const struct btree_keys_ops	*ops;
+ 	/* Hottest entries first */
+ 	struct hlist_node	hash;
+ 
+@@ -151,17 +130,8 @@ struct btree {
+ 	unsigned long		flags;
+ 	uint16_t		written;	/* would be nice to kill */
+ 	uint8_t			level;
+-	uint8_t			nsets;
+-	uint8_t			page_order;
+-
+-	/*
+-	 * Set of sorted keys - the real btree node - plus a binary search tree
+-	 *
+-	 * sets[0] is special; set[0]->tree, set[0]->prev and set[0]->data point
+-	 * to the memory we have allocated for this btree node. Additionally,
+-	 * set[0]->data points to the entire btree node as it exists on disk.
+-	 */
+-	struct bset_tree	sets[MAX_BSETS];
++
++	struct btree_keys	keys;
+ 
+ 	/* For outstanding btree writes, used as a lock - protects write_idx */
+ 	struct closure		io;
+@@ -201,49 +171,19 @@ static inline struct btree_write *btree_prev_write(struct btree *b)
+ 	return b->writes + (btree_node_write_idx(b) ^ 1);
+ }
+ 
+-static inline struct bset_tree *bset_tree_last(struct btree *b)
+-{
+-	return b->sets + b->nsets;
+-}
+-
+ static inline struct bset *btree_bset_first(struct btree *b)
+ {
+-	return b->sets->data;
++	return b->keys.set->data;
+ }
+ 
+ static inline struct bset *btree_bset_last(struct btree *b)
+ {
+-	return bset_tree_last(b)->data;
+-}
+-
+-static inline unsigned bset_byte_offset(struct btree *b, struct bset *i)
+-{
+-	return ((size_t) i) - ((size_t) b->sets->data);
+-}
+-
+-static inline unsigned bset_sector_offset(struct btree *b, struct bset *i)
+-{
+-	return (((void *) i) - ((void *) btree_bset_first(b))) >> 9;
++	return bset_tree_last(&b->keys)->data;
+ }
+ 
+ static inline unsigned bset_block_offset(struct btree *b, struct bset *i)
+ {
+-	return bset_sector_offset(b, i) >> b->c->block_bits;
+-}
+-
+-static inline struct bset *write_block(struct btree *b)
+-{
+-	return ((void *) b->sets[0].data) + b->written * block_bytes(b->c);
+-}
+-
+-static inline bool bset_written(struct btree *b, struct bset_tree *t)
+-{
+-	return t->data < write_block(b);
+-}
+-
+-static inline bool bkey_written(struct btree *b, struct bkey *k)
+-{
+-	return k < write_block(b)->start;
++	return bset_sector_offset(&b->keys, i) >> b->c->block_bits;
+ }
+ 
+ static inline void set_gc_sectors(struct cache_set *c)
+@@ -251,27 +191,6 @@ static inline void set_gc_sectors(struct cache_set *c)
+ 	atomic_set(&c->sectors_to_gc, c->sb.bucket_size * c->nbuckets / 16);
+ }
+ 
+-static inline bool bch_ptr_invalid(struct btree *b, const struct bkey *k)
+-{
+-	return b->ops->key_invalid(b, k);
+-}
+-
+-static inline bool bch_ptr_bad(struct btree *b, const struct bkey *k)
+-{
+-	return b->ops->key_bad(b, k);
+-}
+-
+-/*
+- * Tries to merge l and r: l should be lower than r
+- * Returns true if we were able to merge. If we did merge, l will be the merged
+- * key, r will be untouched.
+- */
+-static inline bool bch_bkey_try_merge(struct btree *b,
+-				      struct bkey *l, struct bkey *r)
+-{
+-	return b->ops->key_merge ?  b->ops->key_merge(b, l, r) : false;
+-}
+-
+ void bkey_put(struct cache_set *c, struct bkey *k);
+ 
+ /* Looping macros */
+@@ -284,7 +203,7 @@ void bkey_put(struct cache_set *c, struct bkey *k);
+ 
+ #define for_each_key_filter(b, k, iter, filter)				\
+ 	for (bch_btree_iter_init((b), (iter), NULL);			\
+-	     ((k) = bch_btree_iter_next_filter((iter), b, filter));)
++	     ((k) = bch_btree_iter_next_filter((iter), &(b)->keys, filter));)
+ 
+ #define for_each_key(b, k, iter)					\
+ 	for (bch_btree_iter_init((b), (iter), NULL);			\
+diff --git a/drivers/md/bcache/debug.c b/drivers/md/bcache/debug.c
+index 2c6587d..8acc18a 100644
+--- a/drivers/md/bcache/debug.c
++++ b/drivers/md/bcache/debug.c
+@@ -113,9 +113,9 @@ static void bch_dump_bucket(struct btree *b)
+ 	unsigned i;
+ 
+ 	console_lock();
+-	for (i = 0; i <= b->nsets; i++)
+-		dump_bset(b, b->sets[i].data,
+-			  bset_block_offset(b, b->sets[i].data));
++	for (i = 0; i <= b->keys.nsets; i++)
++		dump_bset(b, b->keys.set[i].data,
++			  bset_block_offset(b, b->keys.set[i].data));
+ 	console_unlock();
+ }
+ 
+@@ -139,13 +139,13 @@ void bch_btree_verify(struct btree *b)
+ 	mutex_lock(&b->c->verify_lock);
+ 
+ 	ondisk = b->c->verify_ondisk;
+-	sorted = b->c->verify_data->sets->data;
+-	inmemory = b->sets->data;
++	sorted = b->c->verify_data->keys.set->data;
++	inmemory = b->keys.set->data;
+ 
+ 	bkey_copy(&v->key, &b->key);
+ 	v->written = 0;
+ 	v->level = b->level;
+-	v->ops = b->ops;
++	v->keys.ops = b->keys.ops;
+ 
+ 	bio = bch_bbio_alloc(b->c);
+ 	bio->bi_bdev		= PTR_CACHE(b->c, &b->key, 0)->bdev;
+@@ -159,7 +159,7 @@ void bch_btree_verify(struct btree *b)
+ 	memcpy(ondisk, sorted, KEY_SIZE(&v->key) << 9);
+ 
+ 	bch_btree_node_read_done(v);
+-	sorted = v->sets->data;
++	sorted = v->keys.set->data;
+ 
+ 	if (inmemory->keys != sorted->keys ||
+ 	    memcmp(inmemory->start,
+@@ -264,14 +264,14 @@ void __bch_check_keys(struct btree *b, const char *fmt, ...)
+ 			if (p && bkey_cmp(&START_KEY(p), &START_KEY(k)) > 0)
+ 				goto bug;
+ 
+-			if (bch_ptr_invalid(b, k))
++			if (bch_ptr_invalid(&b->keys, k))
+ 				continue;
+ 
+ 			err =  "Overlapping keys";
+ 			if (p && bkey_cmp(p, &START_KEY(k)) > 0)
+ 				goto bug;
+ 		} else {
+-			if (bch_ptr_bad(b, k))
++			if (bch_ptr_bad(&b->keys, k))
+ 				continue;
+ 
+ 			err = "Duplicate keys";
+diff --git a/drivers/md/bcache/extents.c b/drivers/md/bcache/extents.c
+index 8fe6aae..ba30211 100644
+--- a/drivers/md/bcache/extents.c
++++ b/drivers/md/bcache/extents.c
+@@ -81,8 +81,9 @@ bad:
+ 	return true;
+ }
+ 
+-static bool bch_btree_ptr_invalid(struct btree *b, const struct bkey *k)
++static bool bch_btree_ptr_invalid(struct btree_keys *bk, const struct bkey *k)
+ {
++	struct btree *b = container_of(bk, struct btree, keys);
+ 	return __bch_btree_ptr_invalid(b->c, k);
+ }
+ 
+@@ -118,13 +119,14 @@ err:
+ 	return true;
+ }
+ 
+-static bool bch_btree_ptr_bad(struct btree *b, const struct bkey *k)
++static bool bch_btree_ptr_bad(struct btree_keys *bk, const struct bkey *k)
+ {
++	struct btree *b = container_of(bk, struct btree, keys);
+ 	unsigned i;
+ 
+ 	if (!bkey_cmp(k, &ZERO_KEY) ||
+ 	    !KEY_PTRS(k) ||
+-	    bch_ptr_invalid(b, k))
++	    bch_ptr_invalid(bk, k))
+ 		return true;
+ 
+ 	for (i = 0; i < KEY_PTRS(k); i++)
+@@ -209,8 +211,9 @@ static struct bkey *bch_extent_sort_fixup(struct btree_iter *iter,
+ 	return NULL;
+ }
+ 
+-static bool bch_extent_invalid(struct btree *b, const struct bkey *k)
++static bool bch_extent_invalid(struct btree_keys *bk, const struct bkey *k)
+ {
++	struct btree *b = container_of(bk, struct btree, keys);
+ 	char buf[80];
+ 
+ 	if (!KEY_SIZE(k))
+@@ -259,13 +262,14 @@ err:
+ 	return true;
+ }
+ 
+-static bool bch_extent_bad(struct btree *b, const struct bkey *k)
++static bool bch_extent_bad(struct btree_keys *bk, const struct bkey *k)
+ {
++	struct btree *b = container_of(bk, struct btree, keys);
+ 	struct bucket *g;
+ 	unsigned i, stale;
+ 
+ 	if (!KEY_PTRS(k) ||
+-	    bch_extent_invalid(b, k))
++	    bch_extent_invalid(bk, k))
+ 		return true;
+ 
+ 	for (i = 0; i < KEY_PTRS(k); i++)
+@@ -303,8 +307,9 @@ static uint64_t merge_chksums(struct bkey *l, struct bkey *r)
+ 		~((uint64_t)1 << 63);
+ }
+ 
+-static bool bch_extent_merge(struct btree *b, struct bkey *l, struct bkey *r)
++static bool bch_extent_merge(struct btree_keys *bk, struct bkey *l, struct bkey *r)
+ {
++	struct btree *b = container_of(bk, struct btree, keys);
+ 	unsigned i;
+ 
+ 	if (key_merging_disabled(b->c))
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index 206c80f..7e175db 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -433,7 +433,7 @@ lock_root:
+ 
+ 		mutex_lock(&c->bucket_lock);
+ 		list_for_each_entry(b, &c->btree_cache, list)
+-			ret += 1 << (b->page_order + PAGE_SHIFT);
++			ret += 1 << (b->keys.page_order + PAGE_SHIFT);
+ 
+ 		mutex_unlock(&c->bucket_lock);
+ 		return ret;
+diff --git a/include/trace/events/bcache.h b/include/trace/events/bcache.h
+index 0c5cf2f..7110897 100644
+--- a/include/trace/events/bcache.h
++++ b/include/trace/events/bcache.h
+@@ -247,7 +247,7 @@ TRACE_EVENT(bcache_btree_write,
+ 	TP_fast_assign(
+ 		__entry->bucket	= PTR_BUCKET_NR(b->c, &b->key, 0);
+ 		__entry->block	= b->written;
+-		__entry->keys	= b->sets[b->nsets].data->keys;
++		__entry->keys	= b->keys.set[b->keys.nsets].data->keys;
+ 	),
+ 
+ 	TP_printk("bucket %zu", __entry->bucket)
+-- 
+2.6.2
+

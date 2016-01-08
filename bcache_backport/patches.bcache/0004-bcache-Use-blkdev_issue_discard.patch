@@ -1,0 +1,228 @@
+From 49b1212dfacfe51f951442563d1617bb06aac575 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 24 Jul 2013 17:16:09 -0700
+Subject: [PATCH 009434/122806] bcache: Use blkdev_issue_discard()
+
+The old asynchronous discard code was really a relic from when all the
+allocation code was asynchronous - now that allocation runs out of a
+dedicated thread there's no point in keeping around all that complicated
+machinery.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/alloc.c  | 114 +++++----------------------------------------
+ drivers/md/bcache/bcache.h |  10 ----
+ drivers/md/bcache/super.c  |   4 --
+ 3 files changed, 11 insertions(+), 117 deletions(-)
+
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/alloc.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/alloc.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/alloc.c
+@@ -63,13 +63,12 @@
+ #include "bcache.h"
+ #include "btree.h"
+ 
++#include <linux/blkdev.h>
+ #include <linux/freezer.h>
+ #include <linux/kthread.h>
+ #include <linux/random.h>
+ #include <trace/events/bcache.h>
+ 
+-#define MAX_IN_FLIGHT_DISCARDS		8U
+-
+ /* Bucket heap / gen */
+ 
+ uint8_t bch_inc_gen(struct cache *ca, struct bucket *b)
+@@ -121,75 +120,6 @@ void bch_rescale_priorities(struct cache
+ 	mutex_unlock(&c->bucket_lock);
+ }
+ 
+-/* Discard/TRIM */
+-
+-struct discard {
+-	struct list_head	list;
+-	struct work_struct	work;
+-	struct cache		*ca;
+-	long			bucket;
+-
+-	struct bio		bio;
+-	struct bio_vec		bv;
+-};
+-
+-static void discard_finish(struct work_struct *w)
+-{
+-	struct discard *d = container_of(w, struct discard, work);
+-	struct cache *ca = d->ca;
+-	char buf[BDEVNAME_SIZE];
+-
+-	if (!test_bit(BIO_UPTODATE, &d->bio.bi_flags)) {
+-		pr_notice("discard error on %s, disabling",
+-			 bdevname(ca->bdev, buf));
+-		d->ca->discard = 0;
+-	}
+-
+-	mutex_lock(&ca->set->bucket_lock);
+-
+-	fifo_push(&ca->free, d->bucket);
+-	list_add(&d->list, &ca->discards);
+-	atomic_dec(&ca->discards_in_flight);
+-
+-	mutex_unlock(&ca->set->bucket_lock);
+-
+-	closure_wake_up(&ca->set->bucket_wait);
+-	wake_up_process(ca->alloc_thread);
+-
+-	closure_put(&ca->set->cl);
+-}
+-
+-static void discard_endio(struct bio *bio, int error)
+-{
+-	struct discard *d = container_of(bio, struct discard, bio);
+-	schedule_work(&d->work);
+-}
+-
+-static void do_discard(struct cache *ca, long bucket)
+-{
+-	struct discard *d = list_first_entry(&ca->discards,
+-					     struct discard, list);
+-
+-	list_del(&d->list);
+-	d->bucket = bucket;
+-
+-	atomic_inc(&ca->discards_in_flight);
+-	closure_get(&ca->set->cl);
+-
+-	bio_init(&d->bio);
+-
+-	d->bio.bi_sector	= bucket_to_sector(ca->set, d->bucket);
+-	d->bio.bi_bdev		= ca->bdev;
+-	d->bio.bi_rw		= REQ_WRITE|REQ_DISCARD;
+-	d->bio.bi_max_vecs	= 1;
+-	d->bio.bi_io_vec	= d->bio.bi_inline_vecs;
+-	d->bio.bi_size		= bucket_bytes(ca);
+-	d->bio.bi_end_io	= discard_endio;
+-	bio_set_prio(&d->bio, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0));
+-
+-	submit_bio(0, &d->bio);
+-}
+-
+ /* Allocation */
+ 
+ static inline bool can_inc_bucket_gen(struct bucket *b)
+@@ -398,16 +328,18 @@ static int bch_allocator_thread(void *ar
+ 			else
+ 				break;
+ 
+-			allocator_wait(ca, (int) fifo_free(&ca->free) >
+-				       atomic_read(&ca->discards_in_flight));
+-
+ 			if (ca->discard) {
+-				allocator_wait(ca, !list_empty(&ca->discards));
+-				do_discard(ca, bucket);
+-			} else {
+-				fifo_push(&ca->free, bucket);
+-				closure_wake_up(&ca->set->bucket_wait);
++				mutex_unlock(&ca->set->bucket_lock);
++				blkdev_issue_discard(ca->bdev,
++					bucket_to_sector(ca->set, bucket),
++					ca->sb.block_size, GFP_KERNEL, 0);
++				mutex_lock(&ca->set->bucket_lock);
+ 			}
++
++			allocator_wait(ca, !fifo_full(&ca->free));
++
++			fifo_push(&ca->free, bucket);
++			closure_wake_up(&ca->set->bucket_wait);
+ 		}
+ 
+ 		/*
+@@ -556,22 +488,8 @@ int bch_cache_allocator_start(struct cac
+ 	return 0;
+ }
+ 
+-void bch_cache_allocator_exit(struct cache *ca)
+-{
+-	struct discard *d;
+-
+-	while (!list_empty(&ca->discards)) {
+-		d = list_first_entry(&ca->discards, struct discard, list);
+-		cancel_work_sync(&d->work);
+-		list_del(&d->list);
+-		kfree(d);
+-	}
+-}
+-
+ int bch_cache_allocator_init(struct cache *ca)
+ {
+-	unsigned i;
+-
+ 	/*
+ 	 * Reserve:
+ 	 * Prio/gen writes first
+@@ -589,15 +507,5 @@ int bch_cache_allocator_init(struct cach
+ 	ca->watermark[WATERMARK_NONE] = ca->free.size / 2 +
+ 		ca->watermark[WATERMARK_MOVINGGC];
+ 
+-	for (i = 0; i < MAX_IN_FLIGHT_DISCARDS; i++) {
+-		struct discard *d = kzalloc(sizeof(*d), GFP_KERNEL);
+-		if (!d)
+-			return -ENOMEM;
+-
+-		d->ca = ca;
+-		INIT_WORK(&d->work, discard_finish);
+-		list_add(&d->list, &ca->discards);
+-	}
+-
+ 	return 0;
+ }
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bcache.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+@@ -620,15 +620,6 @@ struct cache {
+ 
+ 	bool			discard; /* Get rid of? */
+ 
+-	/*
+-	 * We preallocate structs for issuing discards to buckets, and keep them
+-	 * on this list when they're not in use; do_discard() issues discards
+-	 * whenever there's work to do and is called by free_some_buckets() and
+-	 * when a discard finishes.
+-	 */
+-	atomic_t		discards_in_flight;
+-	struct list_head	discards;
+-
+ 	struct journal_device	journal;
+ 
+ 	/* The rest of this all shows up in sysfs */
+@@ -1226,7 +1217,6 @@ int bch_btree_cache_alloc(struct cache_s
+ void bch_moving_init_cache_set(struct cache_set *);
+ 
+ int bch_cache_allocator_start(struct cache *ca);
+-void bch_cache_allocator_exit(struct cache *ca);
+ int bch_cache_allocator_init(struct cache *ca);
+ 
+ void bch_debug_exit(void);
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/super.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+@@ -1734,8 +1734,6 @@ void bch_cache_release(struct kobject *k
+ 		ca->set->cache[ca->sb.nr_this_dev] = NULL;
+ 	}
+ 
+-	bch_cache_allocator_exit(ca);
+-
+ 	bio_split_pool_free(&ca->bio_split_hook);
+ 
+ 	free_pages((unsigned long) ca->disk_buckets, ilog2(bucket_pages(ca)));
+@@ -1767,8 +1765,6 @@ static int cache_alloc(struct cache_sb *
+ 	__module_get(THIS_MODULE);
+ 	kobject_init(&ca->kobj, &bch_cache_ktype);
+ 
+-	INIT_LIST_HEAD(&ca->discards);
+-
+ 	bio_init(&ca->journal.bio);
+ 	ca->journal.bio.bi_max_vecs = 8;
+ 	ca->journal.bio.bi_io_vec = ca->journal.bio.bi_inline_vecs;

@@ -1,0 +1,29 @@
+From bee63f40cb5f5e8ab2abfbc85acde99cc0acd4b5 Mon Sep 17 00:00:00 2001
+From: Nicholas Swenson <nks@daterainc.com>
+Date: Thu, 31 Oct 2013 19:25:18 -0700
+Subject: [PATCH 015432/122806] bcache: fix for gc crashing when no sectors are
+ used
+
+Signed-off-by: Nicholas Swenson <nks@daterainc.com>
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/movinggc.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/movinggc.c b/drivers/md/bcache/movinggc.c
+index 7c1275e..46c9523 100644
+--- a/drivers/md/bcache/movinggc.c
++++ b/drivers/md/bcache/movinggc.c
+@@ -184,7 +184,8 @@ static bool bucket_cmp(struct bucket *l, struct bucket *r)
+ 
+ static unsigned bucket_heap_top(struct cache *ca)
+ {
+-	return GC_SECTORS_USED(heap_peek(&ca->heap));
++	struct bucket *b;
++	return (b = heap_peek(&ca->heap)) ? GC_SECTORS_USED(b) : 0;
+ }
+ 
+ void bch_moving_gc(struct cache_set *c)
+-- 
+2.6.2
+

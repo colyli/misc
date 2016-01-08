@@ -1,0 +1,122 @@
+From 9a02b7eeeb446a0418ec83afc80eb38bc188f5c8 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Fri, 20 Dec 2013 17:24:46 -0800
+Subject: [PATCH 019174/122806] bcache: Remove/fix some header dependencies
+
+In the process of disentagling/libraryizing bset.c from the rest of the
+bcache code.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h | 23 ++++++++++++++++++-----
+ drivers/md/bcache/bset.h   | 21 ++-------------------
+ drivers/md/bcache/util.h   |  6 ++++++
+ 3 files changed, 26 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 25f0172..3fd8732 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -704,11 +704,6 @@ struct bbio {
+ 	struct bio		bio;
+ };
+ 
+-static inline unsigned local_clock_us(void)
+-{
+-	return local_clock() >> 10;
+-}
+-
+ #define BTREE_PRIO		USHRT_MAX
+ #define INITIAL_PRIO		32768
+ 
+@@ -776,6 +771,24 @@ static inline struct bucket *PTR_BUCKET(struct cache_set *c,
+ 	return PTR_CACHE(c, k, ptr)->buckets + PTR_BUCKET_NR(c, k, ptr);
+ }
+ 
++static inline uint8_t gen_after(uint8_t a, uint8_t b)
++{
++	uint8_t r = a - b;
++	return r > 128U ? 0 : r;
++}
++
++static inline uint8_t ptr_stale(struct cache_set *c, const struct bkey *k,
++				unsigned i)
++{
++	return gen_after(PTR_BUCKET(c, k, i)->gen, PTR_GEN(k, i));
++}
++
++static inline bool ptr_available(struct cache_set *c, const struct bkey *k,
++				 unsigned i)
++{
++	return (PTR_DEV(k, i) < MAX_CACHES_PER_SET) && PTR_CACHE(c, k, i);
++}
++
+ /* Btree key macros */
+ 
+ static inline void bkey_init(struct bkey *k)
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index 1d3c24f..ba02f05 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -142,6 +142,8 @@
+  * first key in that range of bytes again.
+  */
+ 
++struct cache_set;
++
+ /* Btree key comparison/iteration */
+ 
+ #define MAX_BSETS		4U
+@@ -282,25 +284,6 @@ bool bch_extent_ptr_invalid(struct cache_set *, const struct bkey *);
+ 
+ bool bch_ptr_bad(struct btree *, const struct bkey *);
+ 
+-static inline uint8_t gen_after(uint8_t a, uint8_t b)
+-{
+-	uint8_t r = a - b;
+-	return r > 128U ? 0 : r;
+-}
+-
+-static inline uint8_t ptr_stale(struct cache_set *c, const struct bkey *k,
+-				unsigned i)
+-{
+-	return gen_after(PTR_BUCKET(c, k, i)->gen, PTR_GEN(k, i));
+-}
+-
+-static inline bool ptr_available(struct cache_set *c, const struct bkey *k,
+-				 unsigned i)
+-{
+-	return (PTR_DEV(k, i) < MAX_CACHES_PER_SET) && PTR_CACHE(c, k, i);
+-}
+-
+-
+ typedef bool (*ptr_filter_fn)(struct btree *, const struct bkey *);
+ 
+ struct bkey *bch_btree_iter_next(struct btree_iter *);
+diff --git a/drivers/md/bcache/util.h b/drivers/md/bcache/util.h
+index 1030c60..3ebaef5 100644
+--- a/drivers/md/bcache/util.h
++++ b/drivers/md/bcache/util.h
+@@ -2,6 +2,7 @@
+ #ifndef _BCACHE_UTIL_H
+ #define _BCACHE_UTIL_H
+ 
++#include <linux/blkdev.h>
+ #include <linux/errno.h>
+ #include <linux/kernel.h>
+ #include <linux/llist.h>
+@@ -391,6 +392,11 @@ struct time_stats {
+ 
+ void bch_time_stats_update(struct time_stats *stats, uint64_t time);
+ 
++static inline unsigned local_clock_us(void)
++{
++	return local_clock() >> 10;
++}
++
+ #define NSEC_PER_ns			1L
+ #define NSEC_PER_us			NSEC_PER_USEC
+ #define NSEC_PER_ms			NSEC_PER_MSEC
+-- 
+2.6.2
+

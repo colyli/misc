@@ -1,0 +1,36 @@
+From 6b708de64adb6dc8319e7aeac922b46904fbeeec Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 2 Jun 2014 15:39:44 -0700
+Subject: [PATCH 060633/122806] bcache: Fix an infinite loop in journal replay
+
+When running with multiple cache devices, if one of the devices has a completely
+empty journal but we'd already found some journal entries on a previosu device
+we'd go into an infinite loop.
+
+Change-Id: I1dcdc0d738192746de28f40e8b08825b0dea5e2b
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/journal.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index ead001c..fe080ad 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -190,9 +190,12 @@ int bch_journal_read(struct cache_set *c, struct list_head *list)
+ 			if (read_bucket(l))
+ 				goto bsearch;
+ 
+-		if (list_empty(list))
++		/* no journal entries on this device? */
++		if (l == ca->sb.njournal_buckets)
+ 			continue;
+ bsearch:
++		BUG_ON(list_empty(list));
++
+ 		/* Binary search */
+ 		m = l;
+ 		r = find_next_bit(bitmap, ca->sb.njournal_buckets, l + 1);
+-- 
+2.6.2
+

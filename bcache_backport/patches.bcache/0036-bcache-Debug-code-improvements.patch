@@ -1,0 +1,677 @@
+From 280481d06c8a683d9aaa26125476222e76b733c5 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 24 Oct 2013 16:36:03 -0700
+Subject: [PATCH 009466/122806] bcache: Debug code improvements
+
+Couple changes:
+ * Consolidate bch_check_keys() and bch_check_key_order(), and move the
+   checks that only check_key_order() could do to bch_btree_iter_next().
+
+ * Get rid of CONFIG_BCACHE_EDEBUG - now, all that code is compiled in
+   when CONFIG_BCACHE_DEBUG is enabled, and there's now a sysfs file to
+   flip on the EDEBUG checks at runtime.
+
+ * Dropped an old not terribly useful check in rw_unlock(), and
+   refactored/improved a some of the other debug code.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/Kconfig  |  11 +---
+ drivers/md/bcache/alloc.c  |   5 +-
+ drivers/md/bcache/bcache.h |  10 +---
+ drivers/md/bcache/bset.c   | 112 ++++++++++++++++++++-----------------
+ drivers/md/bcache/bset.h   |   3 +
+ drivers/md/bcache/btree.c  |   8 ++-
+ drivers/md/bcache/btree.h  |   8 ---
+ drivers/md/bcache/debug.c  | 136 +++++++++++++++++++--------------------------
+ drivers/md/bcache/debug.h  |  46 +++++++--------
+ drivers/md/bcache/sysfs.c  |   5 ++
+ drivers/md/bcache/util.h   |   4 +-
+ 11 files changed, 162 insertions(+), 186 deletions(-)
+
+diff --git a/drivers/md/bcache/Kconfig b/drivers/md/bcache/Kconfig
+index f950c9d..2638417 100644
+--- a/drivers/md/bcache/Kconfig
++++ b/drivers/md/bcache/Kconfig
+@@ -13,15 +13,8 @@ config BCACHE_DEBUG
+ 	---help---
+ 	Don't select this option unless you're a developer
+ 
+-	Enables extra debugging tools (primarily a fuzz tester)
+-
+-config BCACHE_EDEBUG
+-	bool "Extended runtime checks"
+-	depends on BCACHE
+-	---help---
+-	Don't select this option unless you're a developer
+-
+-	Enables extra runtime checks which significantly affect performance
++	Enables extra debugging tools, allows expensive runtime checks to be
++	turned on.
+ 
+ config BCACHE_CLOSURES_DEBUG
+ 	bool "Debug closures"
+diff --git a/drivers/md/bcache/alloc.c b/drivers/md/bcache/alloc.c
+index 4970ddc..ed5920b 100644
+--- a/drivers/md/bcache/alloc.c
++++ b/drivers/md/bcache/alloc.c
+@@ -398,8 +398,7 @@ long bch_bucket_alloc(struct cache *ca, unsigned watermark, bool wait)
+ out:
+ 	wake_up_process(ca->alloc_thread);
+ 
+-#ifdef CONFIG_BCACHE_EDEBUG
+-	{
++	if (expensive_debug_checks(ca->set)) {
+ 		size_t iter;
+ 		long i;
+ 
+@@ -413,7 +412,7 @@ out:
+ 		fifo_for_each(i, &ca->unused, iter)
+ 			BUG_ON(i == r);
+ 	}
+-#endif
++
+ 	b = ca->buckets + r;
+ 
+ 	BUG_ON(atomic_read(&b->pin) != 1);
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 045cb99..d03bc6f 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -690,6 +690,7 @@ struct cache_set {
+ 	unsigned short		journal_delay_ms;
+ 	unsigned		verify:1;
+ 	unsigned		key_merging_disabled:1;
++	unsigned		expensive_debug_checks:1;
+ 	unsigned		gc_always_rewrite:1;
+ 	unsigned		shrinker_disabled:1;
+ 	unsigned		copy_gc_enabled:1;
+@@ -698,15 +699,6 @@ struct cache_set {
+ 	struct hlist_head	bucket_hash[1 << BUCKET_HASH_BITS];
+ };
+ 
+-static inline bool key_merging_disabled(struct cache_set *c)
+-{
+-#ifdef CONFIG_BCACHE_DEBUG
+-	return c->key_merging_disabled;
+-#else
+-	return 0;
+-#endif
+-}
+-
+ struct bbio {
+ 	unsigned		submit_time_us;
+ 	union {
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index f32216c..6bffde4 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -106,6 +106,43 @@ bad:
+ 	return true;
+ }
+ 
++static bool ptr_bad_expensive_checks(struct btree *b, const struct bkey *k,
++				     unsigned ptr)
++{
++	struct bucket *g = PTR_BUCKET(b->c, k, ptr);
++	char buf[80];
++
++	if (mutex_trylock(&b->c->bucket_lock)) {
++		if (b->level) {
++			if (KEY_DIRTY(k) ||
++			    g->prio != BTREE_PRIO ||
++			    (b->c->gc_mark_valid &&
++			     GC_MARK(g) != GC_MARK_METADATA))
++				goto err;
++
++		} else {
++			if (g->prio == BTREE_PRIO)
++				goto err;
++
++			if (KEY_DIRTY(k) &&
++			    b->c->gc_mark_valid &&
++			    GC_MARK(g) != GC_MARK_DIRTY)
++				goto err;
++		}
++		mutex_unlock(&b->c->bucket_lock);
++	}
++
++	return false;
++err:
++	mutex_unlock(&b->c->bucket_lock);
++	bch_bkey_to_text(buf, sizeof(buf), k);
++	btree_bug(b,
++"inconsistent pointer %s: bucket %zu pin %i prio %i gen %i last_gc %i mark %llu gc_gen %i",
++		  buf, PTR_BUCKET_NR(b->c, k, ptr), atomic_read(&g->pin),
++		  g->prio, g->gen, g->last_gc, GC_MARK(g), g->gc_gen);
++	return true;
++}
++
+ bool bch_ptr_bad(struct btree *b, const struct bkey *k)
+ {
+ 	struct bucket *g;
+@@ -133,46 +170,12 @@ bool bch_ptr_bad(struct btree *b, const struct bkey *k)
+ 		if (stale)
+ 			return true;
+ 
+-#ifdef CONFIG_BCACHE_EDEBUG
+-		if (!mutex_trylock(&b->c->bucket_lock))
+-			continue;
+-
+-		if (b->level) {
+-			if (KEY_DIRTY(k) ||
+-			    g->prio != BTREE_PRIO ||
+-			    (b->c->gc_mark_valid &&
+-			     GC_MARK(g) != GC_MARK_METADATA))
+-				goto bug;
+-
+-		} else {
+-			if (g->prio == BTREE_PRIO)
+-				goto bug;
+-
+-			if (KEY_DIRTY(k) &&
+-			    b->c->gc_mark_valid &&
+-			    GC_MARK(g) != GC_MARK_DIRTY)
+-				goto bug;
+-		}
+-		mutex_unlock(&b->c->bucket_lock);
+-#endif
++		if (expensive_debug_checks(b->c) &&
++		    ptr_bad_expensive_checks(b, k, i))
++			return true;
+ 	}
+ 
+ 	return false;
+-#ifdef CONFIG_BCACHE_EDEBUG
+-bug:
+-	mutex_unlock(&b->c->bucket_lock);
+-
+-	{
+-		char buf[80];
+-
+-		bch_bkey_to_text(buf, sizeof(buf), k);
+-		btree_bug(b,
+-"inconsistent pointer %s: bucket %zu pin %i prio %i gen %i last_gc %i mark %llu gc_gen %i",
+-			  buf, PTR_BUCKET_NR(b->c, k, i), atomic_read(&g->pin),
+-			  g->prio, g->gen, g->last_gc, GC_MARK(g), g->gc_gen);
+-	}
+-	return true;
+-#endif
+ }
+ 
+ /* Key/pointer manipulation */
+@@ -821,16 +824,16 @@ struct bkey *__bch_bset_search(struct btree *b, struct bset_tree *t,
+ 	} else
+ 		i = bset_search_write_set(b, t, search);
+ 
+-#ifdef CONFIG_BCACHE_EDEBUG
+-	BUG_ON(bset_written(b, t) &&
+-	       i.l != t->data->start &&
+-	       bkey_cmp(tree_to_prev_bkey(t,
+-		  inorder_to_tree(bkey_to_cacheline(t, i.l), t)),
+-			search) > 0);
++	if (expensive_debug_checks(b->c)) {
++		BUG_ON(bset_written(b, t) &&
++		       i.l != t->data->start &&
++		       bkey_cmp(tree_to_prev_bkey(t,
++			  inorder_to_tree(bkey_to_cacheline(t, i.l), t)),
++				search) > 0);
+ 
+-	BUG_ON(i.r != end(t->data) &&
+-	       bkey_cmp(i.r, search) <= 0);
+-#endif
++		BUG_ON(i.r != end(t->data) &&
++		       bkey_cmp(i.r, search) <= 0);
++	}
+ 
+ 	while (likely(i.l != i.r) &&
+ 	       bkey_cmp(i.l, search) <= 0)
+@@ -871,12 +874,16 @@ void bch_btree_iter_push(struct btree_iter *iter, struct bkey *k,
+ }
+ 
+ struct bkey *__bch_btree_iter_init(struct btree *b, struct btree_iter *iter,
+-			       struct bkey *search, struct bset_tree *start)
++				   struct bkey *search, struct bset_tree *start)
+ {
+ 	struct bkey *ret = NULL;
+ 	iter->size = ARRAY_SIZE(iter->data);
+ 	iter->used = 0;
+ 
++#ifdef CONFIG_BCACHE_DEBUG
++	iter->b = b;
++#endif
++
+ 	for (; start <= &b->sets[b->nsets]; start++) {
+ 		ret = bch_bset_search(b, start, search);
+ 		bch_btree_iter_push(iter, ret, end(start->data));
+@@ -891,6 +898,8 @@ struct bkey *bch_btree_iter_next(struct btree_iter *iter)
+ 	struct bkey *ret = NULL;
+ 
+ 	if (!btree_iter_end(iter)) {
++		bch_btree_iter_next_check(iter);
++
+ 		ret = iter->data->k;
+ 		iter->data->k = bkey_next(iter->data->k);
+ 
+@@ -1002,7 +1011,6 @@ static void btree_mergesort(struct btree *b, struct bset *out,
+ 	out->keys = last ? (uint64_t *) bkey_next(last) - out->d : 0;
+ 
+ 	pr_debug("sorted %i keys", out->keys);
+-	bch_check_key_order(b, out);
+ }
+ 
+ static void __btree_sort(struct btree *b, struct btree_iter *iter,
+@@ -1063,15 +1071,15 @@ static void __btree_sort(struct btree *b, struct btree_iter *iter,
+ 
+ void bch_btree_sort_partial(struct btree *b, unsigned start)
+ {
+-	size_t oldsize = 0, order = b->page_order, keys = 0;
++	size_t order = b->page_order, keys = 0;
+ 	struct btree_iter iter;
++	int oldsize = bch_count_data(b);
++
+ 	__bch_btree_iter_init(b, &iter, NULL, &b->sets[start]);
+ 
+ 	BUG_ON(b->sets[b->nsets].data == write_block(b) &&
+ 	       (b->sets[b->nsets].size || b->nsets));
+ 
+-	if (b->written)
+-		oldsize = bch_count_data(b);
+ 
+ 	if (start) {
+ 		unsigned i;
+@@ -1087,7 +1095,7 @@ void bch_btree_sort_partial(struct btree *b, unsigned start)
+ 
+ 	__btree_sort(b, &iter, start, order, false);
+ 
+-	EBUG_ON(b->written && bch_count_data(b) != oldsize);
++	EBUG_ON(b->written && oldsize >= 0 && bch_count_data(b) != oldsize);
+ }
+ 
+ void bch_btree_sort_and_fix_extents(struct btree *b, struct btree_iter *iter)
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index 5cd9056..a043a92 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -148,6 +148,9 @@
+ 
+ struct btree_iter {
+ 	size_t size, used;
++#ifdef CONFIG_BCACHE_DEBUG
++	struct btree *b;
++#endif
+ 	struct btree_iter_set {
+ 		struct bkey *k, *end;
+ 	} data[MAX_BSETS];
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index aba787d..fa4d0b1 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -216,6 +216,10 @@ static void bch_btree_node_read_done(struct btree *b)
+ 	iter->size = b->c->sb.bucket_size / b->c->sb.block_size;
+ 	iter->used = 0;
+ 
++#ifdef CONFIG_BCACHE_DEBUG
++	iter->b = b;
++#endif
++
+ 	if (!i->seq)
+ 		goto err;
+ 
+@@ -454,7 +458,7 @@ void bch_btree_node_write(struct btree *b, struct closure *parent)
+ 	BUG_ON(b->written >= btree_blocks(b));
+ 	BUG_ON(b->written && !i->keys);
+ 	BUG_ON(b->sets->data->seq != i->seq);
+-	bch_check_key_order(b, i);
++	bch_check_keys(b, "writing");
+ 
+ 	cancel_delayed_work(&b->work);
+ 
+@@ -1917,7 +1921,7 @@ static bool bch_btree_insert_keys(struct btree *b, struct btree_op *op,
+ 				  struct bkey *replace_key)
+ {
+ 	bool ret = false;
+-	unsigned oldsize = bch_count_data(b);
++	int oldsize = bch_count_data(b);
+ 
+ 	while (!bch_keylist_empty(insert_keys)) {
+ 		struct bset *i = write_block(b);
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 8fc1e89..27e90b1 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -259,14 +259,6 @@ static inline void rw_lock(bool w, struct btree *b, int level)
+ 
+ static inline void rw_unlock(bool w, struct btree *b)
+ {
+-#ifdef CONFIG_BCACHE_EDEBUG
+-	unsigned i;
+-
+-	if (w && b->key.ptr[0])
+-		for (i = 0; i <= b->nsets; i++)
+-			bch_check_key_order(b, b->sets[i].data);
+-#endif
+-
+ 	if (w)
+ 		b->seq++;
+ 	(w ? up_write : up_read)(&b->lock);
+diff --git a/drivers/md/bcache/debug.c b/drivers/md/bcache/debug.c
+index d9ccb31..e99e6b8 100644
+--- a/drivers/md/bcache/debug.c
++++ b/drivers/md/bcache/debug.c
+@@ -76,29 +76,17 @@ int bch_bkey_to_text(char *buf, size_t size, const struct bkey *k)
+ 	return out - buf;
+ }
+ 
+-int bch_btree_to_text(char *buf, size_t size, const struct btree *b)
+-{
+-	return scnprintf(buf, size, "%zu level %i/%i",
+-			 PTR_BUCKET_NR(b->c, &b->key, 0),
+-			 b->level, b->c->root ? b->c->root->level : -1);
+-}
+-
+-#if defined(CONFIG_BCACHE_DEBUG) || defined(CONFIG_BCACHE_EDEBUG)
+-
+-static bool skipped_backwards(struct btree *b, struct bkey *k)
+-{
+-	return bkey_cmp(k, (!b->level)
+-			? &START_KEY(bkey_next(k))
+-			: bkey_next(k)) > 0;
+-}
++#ifdef CONFIG_BCACHE_DEBUG
+ 
+ static void dump_bset(struct btree *b, struct bset *i)
+ {
+-	struct bkey *k;
++	struct bkey *k, *next;
+ 	unsigned j;
+ 	char buf[80];
+ 
+-	for (k = i->start; k < end(i); k = bkey_next(k)) {
++	for (k = i->start; k < end(i); k = next) {
++		next = bkey_next(k);
++
+ 		bch_bkey_to_text(buf, sizeof(buf), k);
+ 		printk(KERN_ERR "block %zu key %zi/%u: %s", index(i, b),
+ 		       (uint64_t *) k - i->d, i->keys, buf);
+@@ -114,15 +102,21 @@ static void dump_bset(struct btree *b, struct bset *i)
+ 
+ 		printk(" %s\n", bch_ptr_status(b->c, k));
+ 
+-		if (bkey_next(k) < end(i) &&
+-		    skipped_backwards(b, k))
++		if (next < end(i) &&
++		    bkey_cmp(k, !b->level ? &START_KEY(next) : next) > 0)
+ 			printk(KERN_ERR "Key skipped backwards\n");
+ 	}
+ }
+ 
+-#endif
++static void bch_dump_bucket(struct btree *b)
++{
++	unsigned i;
+ 
+-#ifdef CONFIG_BCACHE_DEBUG
++	console_lock();
++	for (i = 0; i <= b->nsets; i++)
++		dump_bset(b, b->sets[i].data);
++	console_unlock();
++}
+ 
+ void bch_btree_verify(struct btree *b, struct bset *new)
+ {
+@@ -211,11 +205,7 @@ out_put:
+ 	bio_put(check);
+ }
+ 
+-#endif
+-
+-#ifdef CONFIG_BCACHE_EDEBUG
+-
+-unsigned bch_count_data(struct btree *b)
++int __bch_count_data(struct btree *b)
+ {
+ 	unsigned ret = 0;
+ 	struct btree_iter iter;
+@@ -227,72 +217,60 @@ unsigned bch_count_data(struct btree *b)
+ 	return ret;
+ }
+ 
+-static void vdump_bucket_and_panic(struct btree *b, const char *fmt,
+-				   va_list args)
+-{
+-	unsigned i;
+-	char buf[80];
+-
+-	console_lock();
+-
+-	for (i = 0; i <= b->nsets; i++)
+-		dump_bset(b, b->sets[i].data);
+-
+-	vprintk(fmt, args);
+-
+-	console_unlock();
+-
+-	bch_btree_to_text(buf, sizeof(buf), b);
+-	panic("at %s\n", buf);
+-}
+-
+-void bch_check_key_order_msg(struct btree *b, struct bset *i,
+-			     const char *fmt, ...)
+-{
+-	struct bkey *k;
+-
+-	if (!i->keys)
+-		return;
+-
+-	for (k = i->start; bkey_next(k) < end(i); k = bkey_next(k))
+-		if (skipped_backwards(b, k)) {
+-			va_list args;
+-			va_start(args, fmt);
+-
+-			vdump_bucket_and_panic(b, fmt, args);
+-			va_end(args);
+-		}
+-}
+-
+-void bch_check_keys(struct btree *b, const char *fmt, ...)
++void __bch_check_keys(struct btree *b, const char *fmt, ...)
+ {
+ 	va_list args;
+ 	struct bkey *k, *p = NULL;
+ 	struct btree_iter iter;
+-
+-	if (b->level)
+-		return;
++	const char *err;
+ 
+ 	for_each_key(b, k, &iter) {
+-		if (p && bkey_cmp(&START_KEY(p), &START_KEY(k)) > 0) {
+-			printk(KERN_ERR "Keys out of order:\n");
+-			goto bug;
+-		}
+-
+-		if (bch_ptr_invalid(b, k))
+-			continue;
+-
+-		if (p && bkey_cmp(p, &START_KEY(k)) > 0) {
+-			printk(KERN_ERR "Overlapping keys:\n");
+-			goto bug;
++		if (!b->level) {
++			err = "Keys out of order";
++			if (p && bkey_cmp(&START_KEY(p), &START_KEY(k)) > 0)
++				goto bug;
++
++			if (bch_ptr_invalid(b, k))
++				continue;
++
++			err =  "Overlapping keys";
++			if (p && bkey_cmp(p, &START_KEY(k)) > 0)
++				goto bug;
++		} else {
++			if (bch_ptr_bad(b, k))
++				continue;
++
++			err = "Duplicate keys";
++			if (p && !bkey_cmp(p, k))
++				goto bug;
+ 		}
+ 		p = k;
+ 	}
++
++	err = "Key larger than btree node key";
++	if (p && bkey_cmp(p, &b->key) > 0)
++		goto bug;
++
+ 	return;
+ bug:
++	bch_dump_bucket(b);
++
+ 	va_start(args, fmt);
+-	vdump_bucket_and_panic(b, fmt, args);
++	vprintk(fmt, args);
+ 	va_end(args);
++
++	panic("bcache error: %s:\n", err);
++}
++
++void bch_btree_iter_next_check(struct btree_iter *iter)
++{
++	struct bkey *k = iter->data->k, *next = bkey_next(k);
++
++	if (next < iter->data->end &&
++	    bkey_cmp(k, iter->b->level ? next : &START_KEY(next)) > 0) {
++		bch_dump_bucket(iter->b);
++		panic("Key skipped backwards\n");
++	}
+ }
+ 
+ #endif
+diff --git a/drivers/md/bcache/debug.h b/drivers/md/bcache/debug.h
+index 0f4b344..7914ba0 100644
+--- a/drivers/md/bcache/debug.h
++++ b/drivers/md/bcache/debug.h
+@@ -4,40 +4,42 @@
+ /* Btree/bkey debug printing */
+ 
+ int bch_bkey_to_text(char *buf, size_t size, const struct bkey *k);
+-int bch_btree_to_text(char *buf, size_t size, const struct btree *b);
+-
+-#ifdef CONFIG_BCACHE_EDEBUG
+-
+-unsigned bch_count_data(struct btree *);
+-void bch_check_key_order_msg(struct btree *, struct bset *, const char *, ...);
+-void bch_check_keys(struct btree *, const char *, ...);
+-
+-#define bch_check_key_order(b, i)			\
+-	bch_check_key_order_msg(b, i, "keys out of order")
+-#define EBUG_ON(cond)		BUG_ON(cond)
+-
+-#else /* EDEBUG */
+-
+-#define bch_count_data(b)				0
+-#define bch_check_key_order(b, i)			do {} while (0)
+-#define bch_check_key_order_msg(b, i, ...)		do {} while (0)
+-#define bch_check_keys(b, ...)				do {} while (0)
+-#define EBUG_ON(cond)					do {} while (0)
+-
+-#endif
+ 
+ #ifdef CONFIG_BCACHE_DEBUG
+ 
+ void bch_btree_verify(struct btree *, struct bset *);
+ void bch_data_verify(struct cached_dev *, struct bio *);
++int __bch_count_data(struct btree *);
++void __bch_check_keys(struct btree *, const char *, ...);
++void bch_btree_iter_next_check(struct btree_iter *);
++
++#define EBUG_ON(cond)			BUG_ON(cond)
++#define expensive_debug_checks(c)	((c)->expensive_debug_checks)
++#define key_merging_disabled(c)		((c)->key_merging_disabled)
+ 
+ #else /* DEBUG */
+ 
+ static inline void bch_btree_verify(struct btree *b, struct bset *i) {}
+-static inline void bch_data_verify(struct cached_dev *dc, struct bio *bio) {};
++static inline void bch_data_verify(struct cached_dev *dc, struct bio *bio) {}
++static inline int __bch_count_data(struct btree *b) { return -1; }
++static inline void __bch_check_keys(struct btree *b, const char *fmt, ...) {}
++static inline void bch_btree_iter_next_check(struct btree_iter *iter) {}
++
++#define EBUG_ON(cond)			do { if (cond); } while (0)
++#define expensive_debug_checks(c)	0
++#define key_merging_disabled(c)		0
+ 
+ #endif
+ 
++#define bch_count_data(b)						\
++	(expensive_debug_checks((b)->c) ? __bch_count_data(b) : -1)
++
++#define bch_check_keys(b, ...)						\
++do {									\
++	if (expensive_debug_checks((b)->c))				\
++		__bch_check_keys(b, __VA_ARGS__);			\
++} while (0)
++
+ #ifdef CONFIG_DEBUG_FS
+ void bch_debug_init_cache_set(struct cache_set *);
+ #else
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index ab286b9..9687771 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -102,6 +102,7 @@ rw_attribute(io_error_halflife);
+ rw_attribute(verify);
+ rw_attribute(key_merging_disabled);
+ rw_attribute(gc_always_rewrite);
++rw_attribute(expensive_debug_checks);
+ rw_attribute(freelist_percent);
+ rw_attribute(cache_replacement_policy);
+ rw_attribute(btree_shrinker_disabled);
+@@ -517,6 +518,8 @@ lock_root:
+ 	sysfs_print(active_journal_entries,	fifo_used(&c->journal.pin));
+ 	sysfs_printf(verify,			"%i", c->verify);
+ 	sysfs_printf(key_merging_disabled,	"%i", c->key_merging_disabled);
++	sysfs_printf(expensive_debug_checks,
++		     "%i", c->expensive_debug_checks);
+ 	sysfs_printf(gc_always_rewrite,		"%i", c->gc_always_rewrite);
+ 	sysfs_printf(btree_shrinker_disabled,	"%i", c->shrinker_disabled);
+ 	sysfs_printf(copy_gc_enabled,		"%i", c->copy_gc_enabled);
+@@ -599,6 +602,7 @@ STORE(__bch_cache_set)
+ 	sysfs_strtoul(journal_delay_ms,		c->journal_delay_ms);
+ 	sysfs_strtoul(verify,			c->verify);
+ 	sysfs_strtoul(key_merging_disabled,	c->key_merging_disabled);
++	sysfs_strtoul(expensive_debug_checks,	c->expensive_debug_checks);
+ 	sysfs_strtoul(gc_always_rewrite,	c->gc_always_rewrite);
+ 	sysfs_strtoul(btree_shrinker_disabled,	c->shrinker_disabled);
+ 	sysfs_strtoul(copy_gc_enabled,		c->copy_gc_enabled);
+@@ -674,6 +678,7 @@ static struct attribute *bch_cache_set_internal_files[] = {
+ #ifdef CONFIG_BCACHE_DEBUG
+ 	&sysfs_verify,
+ 	&sysfs_key_merging_disabled,
++	&sysfs_expensive_debug_checks,
+ #endif
+ 	&sysfs_gc_always_rewrite,
+ 	&sysfs_btree_shrinker_disabled,
+diff --git a/drivers/md/bcache/util.h b/drivers/md/bcache/util.h
+index 38ae7a4..8ce5aab 100644
+--- a/drivers/md/bcache/util.h
++++ b/drivers/md/bcache/util.h
+@@ -15,12 +15,12 @@
+ 
+ struct closure;
+ 
+-#ifdef CONFIG_BCACHE_EDEBUG
++#ifdef CONFIG_BCACHE_DEBUG
+ 
+ #define atomic_dec_bug(v)	BUG_ON(atomic_dec_return(v) < 0)
+ #define atomic_inc_bug(v, i)	BUG_ON(atomic_inc_return(v) <= i)
+ 
+-#else /* EDEBUG */
++#else /* DEBUG */
+ 
+ #define atomic_dec_bug(v)	atomic_dec(v)
+ #define atomic_inc_bug(v, i)	atomic_inc(v)
+-- 
+2.6.2
+

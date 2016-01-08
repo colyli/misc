@@ -1,0 +1,124 @@
+From 6054c6d4da1940c7bf8870c6393773aa794f53d8 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 24 Jul 2013 18:06:22 -0700
+Subject: [PATCH 009460/122806] bcache: Don't use op->insert_collision
+
+When we convert bch_btree_insert() to bch_btree_map_leaf_nodes(), we
+won't be passing struct btree_op to bch_btree_insert() anymore - so we
+need a different way of returning whether there was a collision (really,
+a replace collision).
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c     |  3 +++
+ drivers/md/bcache/movinggc.c  |  2 +-
+ drivers/md/bcache/request.c   | 10 +++++++---
+ drivers/md/bcache/request.h   |  1 +
+ drivers/md/bcache/writeback.c |  7 ++++---
+ 5 files changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 7a1d8dc..441524d 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -2227,6 +2227,9 @@ int bch_btree_insert(struct btree_op *op, struct cache_set *c,
+ 		}
+ 	}
+ 
++	if (op->insert_collision)
++		return -ESRCH;
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/md/bcache/movinggc.c b/drivers/md/bcache/movinggc.c
+index c45ba4f..601c96a 100644
+--- a/drivers/md/bcache/movinggc.c
++++ b/drivers/md/bcache/movinggc.c
+@@ -52,7 +52,7 @@ static void write_moving_finish(struct closure *cl)
+ 	bio_for_each_segment_all(bv, bio, i)
+ 		__free_page(bv->bv_page);
+ 
+-	if (io->s.op.insert_collision)
++	if (io->s.insert_collision)
+ 		trace_bcache_gc_copy_collision(&io->w->key);
+ 
+ 	bch_keybuf_del(&io->s.c->moving_gc_keys, io->w);
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 16a3e16..bcce06a 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -218,6 +218,7 @@ static void bch_data_insert_keys(struct closure *cl)
+ 	struct search *s = container_of(cl, struct search, btree);
+ 	atomic_t *journal_ref = NULL;
+ 	struct bkey *replace_key = s->replace ? &s->replace_key : NULL;
++	int ret;
+ 
+ 	/*
+ 	 * If we're looping, might already be waiting on
+@@ -236,8 +237,11 @@ static void bch_data_insert_keys(struct closure *cl)
+ 					  s->flush_journal
+ 					  ? &s->cl : NULL);
+ 
+-	if (bch_btree_insert(&s->op, s->c, &s->insert_keys,
+-			     journal_ref, replace_key)) {
++	ret = bch_btree_insert(&s->op, s->c, &s->insert_keys,
++			       journal_ref, replace_key);
++	if (ret == -ESRCH) {
++		s->insert_collision = true;
++	} else if (ret) {
+ 		s->error		= -ENOMEM;
+ 		s->insert_data_done	= true;
+ 	}
+@@ -977,7 +981,7 @@ static void cached_dev_cache_miss_done(struct closure *cl)
+ {
+ 	struct search *s = container_of(cl, struct search, cl);
+ 
+-	if (s->op.insert_collision)
++	if (s->insert_collision)
+ 		bch_mark_cache_miss_collision(s);
+ 
+ 	if (s->cache_bio) {
+diff --git a/drivers/md/bcache/request.h b/drivers/md/bcache/request.h
+index 5ea7a0e..f0e930b 100644
+--- a/drivers/md/bcache/request.h
++++ b/drivers/md/bcache/request.h
+@@ -34,6 +34,7 @@ struct search {
+ 
+ 	unsigned		insert_data_done:1;
+ 	unsigned		replace:1;
++	unsigned		insert_collision:1;
+ 
+ 	uint16_t		write_prio;
+ 
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index 346a534..312032e 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -142,6 +142,7 @@ static void write_dirty_finish(struct closure *cl)
+ 		unsigned i;
+ 		struct btree_op op;
+ 		struct keylist keys;
++		int ret;
+ 
+ 		bch_btree_op_init(&op, -1);
+ 		bch_keylist_init(&keys);
+@@ -153,12 +154,12 @@ static void write_dirty_finish(struct closure *cl)
+ 		for (i = 0; i < KEY_PTRS(&w->key); i++)
+ 			atomic_inc(&PTR_BUCKET(dc->disk.c, &w->key, i)->pin);
+ 
+-		bch_btree_insert(&op, dc->disk.c, &keys, NULL, &w->key);
++		ret = bch_btree_insert(&op, dc->disk.c, &keys, NULL, &w->key);
+ 
+-		if (op.insert_collision)
++		if (ret)
+ 			trace_bcache_writeback_collision(&w->key);
+ 
+-		atomic_long_inc(op.insert_collision
++		atomic_long_inc(ret
+ 				? &dc->disk.c->writeback_keys_failed
+ 				: &dc->disk.c->writeback_keys_done);
+ 	}
+-- 
+2.6.2
+

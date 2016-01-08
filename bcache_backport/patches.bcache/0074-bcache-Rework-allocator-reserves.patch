@@ -1,0 +1,530 @@
+From 78365411b344df35a198b119133e6515c2dcfb9f Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Tue, 17 Dec 2013 01:29:34 -0800
+Subject: [PATCH 019167/122806] bcache: Rework allocator reserves
+
+We need a reserve for allocating buckets for new btree nodes - and now that
+we've got multiple btrees, it really needs to be per btree.
+
+This reworks the reserves so we've got separate freelists for each reserve
+instead of watermarks, which seems to make things a bit cleaner, and it adds
+some code so that btree_split() can make sure the reserve is available before it
+starts.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/alloc.c     | 72 ++++++++++++++++++++++++++-----------------
+ drivers/md/bcache/bcache.h    | 16 +++++-----
+ drivers/md/bcache/btree.c     | 34 ++++++++++++++++++--
+ drivers/md/bcache/btree.h     |  4 +++
+ drivers/md/bcache/movinggc.c  |  2 +-
+ drivers/md/bcache/super.c     | 21 ++++++++-----
+ drivers/md/bcache/sysfs.c     | 31 -------------------
+ include/trace/events/bcache.h |  8 ++---
+ 8 files changed, 105 insertions(+), 83 deletions(-)
+
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/alloc.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/alloc.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/alloc.c
+@@ -132,10 +132,16 @@ bool bch_bucket_add_unused(struct cache
+ {
+ 	BUG_ON(GC_MARK(b) || GC_SECTORS_USED(b));
+ 
+-	if (fifo_used(&ca->free) > ca->watermark[WATERMARK_MOVINGGC] &&
+-	    CACHE_REPLACEMENT(&ca->sb) == CACHE_REPLACEMENT_FIFO)
+-		return false;
++	if (CACHE_REPLACEMENT(&ca->sb) == CACHE_REPLACEMENT_FIFO) {
++		unsigned i;
++
++		for (i = 0; i < RESERVE_NONE; i++)
++			if (!fifo_full(&ca->free[i]))
++				goto add;
+ 
++		return false;
++	}
++add:
+ 	b->prio = 0;
+ 
+ 	if (can_inc_bucket_gen(b) &&
+@@ -304,6 +310,21 @@ do {									\
+ 	__set_current_state(TASK_RUNNING);				\
+ } while (0)
+ 
++static int bch_allocator_push(struct cache *ca, long bucket)
++{
++	unsigned i;
++
++	/* Prios/gens are actually the most important reserve */
++	if (fifo_push(&ca->free[RESERVE_PRIO], bucket))
++		return true;
++
++	for (i = 0; i < RESERVE_NR; i++)
++		if (fifo_push(&ca->free[i], bucket))
++			return true;
++
++	return false;
++}
++
+ static int bch_allocator_thread(void *arg)
+ {
+ 	struct cache *ca = arg;
+@@ -336,9 +357,7 @@ static int bch_allocator_thread(void *ar
+ 				mutex_lock(&ca->set->bucket_lock);
+ 			}
+ 
+-			allocator_wait(ca, !fifo_full(&ca->free));
+-
+-			fifo_push(&ca->free, bucket);
++			allocator_wait(ca, bch_allocator_push(ca, bucket));
+ 			wake_up(&ca->set->bucket_wait);
+ 		}
+ 
+@@ -365,34 +384,29 @@ static int bch_allocator_thread(void *ar
+ 	}
+ }
+ 
+-long bch_bucket_alloc(struct cache *ca, unsigned watermark, bool wait)
++long bch_bucket_alloc(struct cache *ca, unsigned reserve, bool wait)
+ {
+ 	DEFINE_WAIT(w);
+ 	struct bucket *b;
+ 	long r;
+ 
+ 	/* fastpath */
+-	if (fifo_used(&ca->free) > ca->watermark[watermark]) {
+-		fifo_pop(&ca->free, r);
++	if (fifo_pop(&ca->free[RESERVE_NONE], r) ||
++	    fifo_pop(&ca->free[reserve], r))
+ 		goto out;
+-	}
+ 
+ 	if (!wait)
+ 		return -1;
+ 
+-	while (1) {
+-		if (fifo_used(&ca->free) > ca->watermark[watermark]) {
+-			fifo_pop(&ca->free, r);
+-			break;
+-		}
+-
++	do {
+ 		prepare_to_wait(&ca->set->bucket_wait, &w,
+ 				TASK_UNINTERRUPTIBLE);
+ 
+ 		mutex_unlock(&ca->set->bucket_lock);
+ 		schedule();
+ 		mutex_lock(&ca->set->bucket_lock);
+-	}
++	} while (!fifo_pop(&ca->free[RESERVE_NONE], r) &&
++		 !fifo_pop(&ca->free[reserve], r));
+ 
+ 	finish_wait(&ca->set->bucket_wait, &w);
+ out:
+@@ -401,12 +415,14 @@ out:
+ 	if (expensive_debug_checks(ca->set)) {
+ 		size_t iter;
+ 		long i;
++		unsigned j;
+ 
+ 		for (iter = 0; iter < prio_buckets(ca) * 2; iter++)
+ 			BUG_ON(ca->prio_buckets[iter] == (uint64_t) r);
+ 
+-		fifo_for_each(i, &ca->free, iter)
+-			BUG_ON(i == r);
++		for (j = 0; j < RESERVE_NR; j++)
++			fifo_for_each(i, &ca->free[j], iter)
++				BUG_ON(i == r);
+ 		fifo_for_each(i, &ca->free_inc, iter)
+ 			BUG_ON(i == r);
+ 		fifo_for_each(i, &ca->unused, iter)
+@@ -419,7 +435,7 @@ out:
+ 
+ 	SET_GC_SECTORS_USED(b, ca->sb.bucket_size);
+ 
+-	if (watermark <= WATERMARK_METADATA) {
++	if (reserve <= RESERVE_PRIO) {
+ 		SET_GC_MARK(b, GC_MARK_METADATA);
+ 		SET_GC_MOVE(b, 0);
+ 		b->prio = BTREE_PRIO;
+@@ -445,7 +461,7 @@ void bch_bucket_free(struct cache_set *c
+ 	}
+ }
+ 
+-int __bch_bucket_alloc_set(struct cache_set *c, unsigned watermark,
++int __bch_bucket_alloc_set(struct cache_set *c, unsigned reserve,
+ 			   struct bkey *k, int n, bool wait)
+ {
+ 	int i;
+@@ -459,7 +475,7 @@ int __bch_bucket_alloc_set(struct cache_
+ 
+ 	for (i = 0; i < n; i++) {
+ 		struct cache *ca = c->cache_by_alloc[i];
+-		long b = bch_bucket_alloc(ca, watermark, wait);
++		long b = bch_bucket_alloc(ca, reserve, wait);
+ 
+ 		if (b == -1)
+ 			goto err;
+@@ -478,12 +494,12 @@ err:
+ 	return -1;
+ }
+ 
+-int bch_bucket_alloc_set(struct cache_set *c, unsigned watermark,
++int bch_bucket_alloc_set(struct cache_set *c, unsigned reserve,
+ 			 struct bkey *k, int n, bool wait)
+ {
+ 	int ret;
+ 	mutex_lock(&c->bucket_lock);
+-	ret = __bch_bucket_alloc_set(c, watermark, k, n, wait);
++	ret = __bch_bucket_alloc_set(c, reserve, k, n, wait);
+ 	mutex_unlock(&c->bucket_lock);
+ 	return ret;
+ }
+@@ -573,8 +589,8 @@ bool bch_alloc_sectors(struct cache_set
+ 
+ 	while (!(b = pick_data_bucket(c, k, write_point, &alloc.key))) {
+ 		unsigned watermark = write_prio
+-			? WATERMARK_MOVINGGC
+-			: WATERMARK_NONE;
++			? RESERVE_MOVINGGC
++			: RESERVE_NONE;
+ 
+ 		spin_unlock(&c->data_bucket_lock);
+ 
+@@ -689,7 +705,7 @@ int bch_cache_allocator_init(struct cach
+ 	 * Then 8 for btree allocations
+ 	 * Then half for the moving garbage collector
+ 	 */
+-
++#if 0
+ 	ca->watermark[WATERMARK_PRIO] = 0;
+ 
+ 	ca->watermark[WATERMARK_METADATA] = prio_buckets(ca);
+@@ -699,6 +715,6 @@ int bch_cache_allocator_init(struct cach
+ 
+ 	ca->watermark[WATERMARK_NONE] = ca->free.size / 2 +
+ 		ca->watermark[WATERMARK_MOVINGGC];
+-
++#endif
+ 	return 0;
+ }
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bcache.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+@@ -383,12 +383,12 @@ struct cached_dev {
+ 	unsigned		writeback_rate_p_term_inverse;
+ };
+ 
+-enum alloc_watermarks {
+-	WATERMARK_PRIO,
+-	WATERMARK_METADATA,
+-	WATERMARK_MOVINGGC,
+-	WATERMARK_NONE,
+-	WATERMARK_MAX
++enum alloc_reserve {
++	RESERVE_BTREE,
++	RESERVE_PRIO,
++	RESERVE_MOVINGGC,
++	RESERVE_NONE,
++	RESERVE_NR,
+ };
+ 
+ struct cache {
+@@ -400,8 +400,6 @@ struct cache {
+ 	struct kobject		kobj;
+ 	struct block_device	*bdev;
+ 
+-	unsigned		watermark[WATERMARK_MAX];
+-
+ 	struct task_struct	*alloc_thread;
+ 
+ 	struct closure		prio;
+@@ -430,7 +428,7 @@ struct cache {
+ 	 * because all the data they contained was overwritten), so we only
+ 	 * need to discard them before they can be moved to the free list.
+ 	 */
+-	DECLARE_FIFO(long, free);
++	DECLARE_FIFO(long, free)[RESERVE_NR];
+ 	DECLARE_FIFO(long, free_inc);
+ 	DECLARE_FIFO(long, unused);
+ 
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/btree.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/btree.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/btree.c
+@@ -167,6 +167,8 @@ static inline bool should_split(struct b
+ 			_r = bch_btree_ ## fn(_b, op, ##__VA_ARGS__);	\
+ 		}							\
+ 		rw_unlock(_w, _b);					\
++		if (_r == -EINTR)					\
++			schedule();					\
+ 		bch_cannibalize_unlock(c);				\
+ 		if (_r == -ENOSPC) {					\
+ 			wait_event((c)->try_wait,			\
+@@ -175,6 +177,7 @@ static inline bool should_split(struct b
+ 		}							\
+ 	} while (_r == -EINTR);						\
+ 									\
++	finish_wait(&(c)->bucket_wait, &(op)->wait);			\
+ 	_r;								\
+ })
+ 
+@@ -1075,7 +1078,7 @@ struct btree *bch_btree_node_alloc(struc
+ 
+ 	mutex_lock(&c->bucket_lock);
+ retry:
+-	if (__bch_bucket_alloc_set(c, WATERMARK_METADATA, &k.key, 1, wait))
++	if (__bch_bucket_alloc_set(c, RESERVE_BTREE, &k.key, 1, wait))
+ 		goto err;
+ 
+ 	bkey_put(c, &k.key);
+@@ -1132,6 +1135,28 @@ static void make_btree_freeing_key(struc
+ 	atomic_inc(&b->c->prio_blocked);
+ }
+ 
++static int btree_check_reserve(struct btree *b, struct btree_op *op)
++{
++	struct cache_set *c = b->c;
++	struct cache *ca;
++	unsigned i, reserve = c->root->level * 2 + 1;
++	int ret = 0;
++
++	mutex_lock(&c->bucket_lock);
++
++	for_each_cache(ca, c, i)
++		if (fifo_used(&ca->free[RESERVE_BTREE]) < reserve) {
++			if (op)
++				prepare_to_wait(&c->bucket_wait, &op->wait,
++						TASK_UNINTERRUPTIBLE);
++			ret = -EINTR;
++			break;
++		}
++
++	mutex_unlock(&c->bucket_lock);
++	return ret;
++}
++
+ /* Garbage collection */
+ 
+ uint8_t __bch_btree_mark_key(struct cache_set *c, int level, struct bkey *k)
+@@ -1428,7 +1453,8 @@ static int btree_gc_recurse(struct btree
+ 
+ 		if (!IS_ERR(last->b)) {
+ 			should_rewrite = btree_gc_mark_node(last->b, gc);
+-			if (should_rewrite) {
++			if (should_rewrite &&
++			    !btree_check_reserve(b, NULL)) {
+ 				n = btree_node_alloc_replacement(last->b,
+ 								 false);
+ 
+@@ -2071,6 +2097,10 @@ static int btree_split(struct btree *b,
+ 	closure_init_stack(&cl);
+ 	bch_keylist_init(&parent_keys);
+ 
++	if (!b->level &&
++	    btree_check_reserve(b, op))
++		return -EINTR;
++
+ 	n1 = btree_node_alloc_replacement(b, true);
+ 	if (IS_ERR(n1))
+ 		goto err;
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/btree.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/btree.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/btree.h
+@@ -241,6 +241,9 @@ void bkey_put(struct cache_set *c, struc
+ /* Recursing down the btree */
+ 
+ struct btree_op {
++	/* for waiting on btree reserve in btree_split() */
++	wait_queue_t		wait;
++
+ 	/* Btree level at which we start taking write locks */
+ 	short			lock;
+ 
+@@ -250,6 +253,7 @@ struct btree_op {
+ static inline void bch_btree_op_init(struct btree_op *op, int write_lock_level)
+ {
+ 	memset(op, 0, sizeof(struct btree_op));
++	init_wait(&op->wait);
+ 	op->lock = write_lock_level;
+ }
+ 
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/movinggc.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/movinggc.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/movinggc.c
+@@ -211,7 +211,7 @@ void bch_moving_gc(struct cache_set *c)
+ 	for_each_cache(ca, c, i) {
+ 		unsigned sectors_to_move = 0;
+ 		unsigned reserve_sectors = ca->sb.bucket_size *
+-			min(fifo_used(&ca->free), ca->free.size / 2);
++			fifo_used(&ca->free[RESERVE_MOVINGGC]);
+ 
+ 		ca->heap.used = 0;
+ 
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/super.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+@@ -444,7 +444,7 @@ static int __uuid_write(struct cache_set
+ 
+ 	lockdep_assert_held(&bch_register_lock);
+ 
+-	if (bch_bucket_alloc_set(c, WATERMARK_METADATA, &k.key, 1, true))
++	if (bch_bucket_alloc_set(c, RESERVE_BTREE, &k.key, 1, true))
+ 		return 1;
+ 
+ 	SET_KEY_SIZE(&k.key, c->sb.bucket_size);
+@@ -562,8 +562,8 @@ void bch_prio_write(struct cache *ca)
+ 	atomic_long_add(ca->sb.bucket_size * prio_buckets(ca),
+ 			&ca->meta_sectors_written);
+ 
+-	pr_debug("free %zu, free_inc %zu, unused %zu", fifo_used(&ca->free),
+-		 fifo_used(&ca->free_inc), fifo_used(&ca->unused));
++	//pr_debug("free %zu, free_inc %zu, unused %zu", fifo_used(&ca->free),
++	//	 fifo_used(&ca->free_inc), fifo_used(&ca->unused));
+ 
+ 	for (i = prio_buckets(ca) - 1; i >= 0; --i) {
+ 		long bucket;
+@@ -582,7 +582,7 @@ void bch_prio_write(struct cache *ca)
+ 		p->magic	= pset_magic(&ca->sb);
+ 		p->csum		= bch_crc64(&p->magic, bucket_bytes(ca) - 8);
+ 
+-		bucket = bch_bucket_alloc(ca, WATERMARK_PRIO, true);
++		bucket = bch_bucket_alloc(ca, RESERVE_PRIO, true);
+ 		BUG_ON(bucket == -1);
+ 
+ 		mutex_unlock(&ca->set->bucket_lock);
+@@ -1774,6 +1774,7 @@ err:
+ void bch_cache_release(struct kobject *kobj)
+ {
+ 	struct cache *ca = container_of(kobj, struct cache, kobj);
++	unsigned i;
+ 
+ 	if (ca->set) {
+ 		BUG_ON(ca->set->cache[ca->sb.nr_this_dev] != ca);
+@@ -1789,7 +1790,9 @@ void bch_cache_release(struct kobject *k
+ 	free_heap(&ca->heap);
+ 	free_fifo(&ca->unused);
+ 	free_fifo(&ca->free_inc);
+-	free_fifo(&ca->free);
++
++	for (i = 0; i < RESERVE_NR; i++)
++		free_fifo(&ca->free[i]);
+ 
+ 	if (ca->sb_bio.bi_inline_vecs[0].bv_page)
+ 		put_page(ca->sb_bio.bi_io_vec[0].bv_page);
+@@ -1815,10 +1818,12 @@ static int cache_alloc(struct cache_sb *
+ 	ca->journal.bio.bi_max_vecs = 8;
+ 	ca->journal.bio.bi_io_vec = ca->journal.bio.bi_inline_vecs;
+ 
+-	free = roundup_pow_of_two(ca->sb.nbuckets) >> 9;
+-	free = max_t(size_t, free, (prio_buckets(ca) + 8) * 2);
++	free = roundup_pow_of_two(ca->sb.nbuckets) >> 10;
+ 
+-	if (!init_fifo(&ca->free,	free, GFP_KERNEL) ||
++	if (!init_fifo(&ca->free[RESERVE_BTREE], 8, GFP_KERNEL) ||
++	    !init_fifo(&ca->free[RESERVE_PRIO], prio_buckets(ca), GFP_KERNEL) ||
++	    !init_fifo(&ca->free[RESERVE_MOVINGGC], free, GFP_KERNEL) ||
++	    !init_fifo(&ca->free[RESERVE_NONE], free, GFP_KERNEL) ||
+ 	    !init_fifo(&ca->free_inc,	free << 2, GFP_KERNEL) ||
+ 	    !init_fifo(&ca->unused,	free << 2, GFP_KERNEL) ||
+ 	    !init_heap(&ca->heap,	free << 3, GFP_KERNEL) ||
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/sysfs.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/sysfs.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/sysfs.c
+@@ -102,7 +102,6 @@ rw_attribute(bypass_torture_test);
+ rw_attribute(key_merging_disabled);
+ rw_attribute(gc_always_rewrite);
+ rw_attribute(expensive_debug_checks);
+-rw_attribute(freelist_percent);
+ rw_attribute(cache_replacement_policy);
+ rw_attribute(btree_shrinker_disabled);
+ rw_attribute(copy_gc_enabled);
+@@ -711,9 +710,6 @@ SHOW(__bch_cache)
+ 	sysfs_print(io_errors,
+ 		    atomic_read(&ca->io_errors) >> IO_ERROR_SHIFT);
+ 
+-	sysfs_print(freelist_percent, ca->free.size * 100 /
+-		    ((size_t) ca->sb.nbuckets));
+-
+ 	if (attr == &sysfs_cache_replacement_policy)
+ 		return bch_snprint_string_list(buf, PAGE_SIZE,
+ 					       cache_replacement_policies,
+@@ -820,32 +816,6 @@ STORE(__bch_cache)
+ 		}
+ 	}
+ 
+-	if (attr == &sysfs_freelist_percent) {
+-		DECLARE_FIFO(long, free);
+-		long i;
+-		size_t p = strtoul_or_return(buf);
+-
+-		p = clamp_t(size_t,
+-			    ((size_t) ca->sb.nbuckets * p) / 100,
+-			    roundup_pow_of_two(ca->sb.nbuckets) >> 9,
+-			    ca->sb.nbuckets / 2);
+-
+-		if (!init_fifo_exact(&free, p, GFP_KERNEL))
+-			return -ENOMEM;
+-
+-		mutex_lock(&ca->set->bucket_lock);
+-
+-		fifo_move(&free, &ca->free);
+-		fifo_swap(&free, &ca->free);
+-
+-		mutex_unlock(&ca->set->bucket_lock);
+-
+-		while (fifo_pop(&free, i))
+-			atomic_dec(&ca->buckets[i].pin);
+-
+-		free_fifo(&free);
+-	}
+-
+ 	if (attr == &sysfs_clear_stats) {
+ 		atomic_long_set(&ca->sectors_written, 0);
+ 		atomic_long_set(&ca->btree_sectors_written, 0);
+@@ -869,7 +839,6 @@ static struct attribute *bch_cache_files
+ 	&sysfs_metadata_written,
+ 	&sysfs_io_errors,
+ 	&sysfs_clear_stats,
+-	&sysfs_freelist_percent,
+ 	&sysfs_cache_replacement_policy,
+ 	NULL
+ };
+Index: linux-3.12-SLE12-SP1/include/trace/events/bcache.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/include/trace/events/bcache.h
++++ linux-3.12-SLE12-SP1/include/trace/events/bcache.h
+@@ -411,7 +411,7 @@ TRACE_EVENT(bcache_alloc_invalidate,
+ 	),
+ 
+ 	TP_fast_assign(
+-		__entry->free		= fifo_used(&ca->free);
++		__entry->free		= fifo_used(&ca->free[RESERVE_NONE]);
+ 		__entry->free_inc	= fifo_used(&ca->free_inc);
+ 		__entry->free_inc_size	= ca->free_inc.size;
+ 		__entry->unused		= fifo_used(&ca->unused);
+@@ -422,8 +422,8 @@ TRACE_EVENT(bcache_alloc_invalidate,
+ );
+ 
+ TRACE_EVENT(bcache_alloc_fail,
+-	TP_PROTO(struct cache *ca),
+-	TP_ARGS(ca),
++	TP_PROTO(struct cache *ca, unsigned reserve),
++	TP_ARGS(ca, reserve),
+ 
+ 	TP_STRUCT__entry(
+ 		__field(unsigned,	free			)
+@@ -433,7 +433,7 @@ TRACE_EVENT(bcache_alloc_fail,
+ 	),
+ 
+ 	TP_fast_assign(
+-		__entry->free		= fifo_used(&ca->free);
++		__entry->free		= fifo_used(&ca->free[reserve]);
+ 		__entry->free_inc	= fifo_used(&ca->free_inc);
+ 		__entry->unused		= fifo_used(&ca->unused);
+ 		__entry->blocked	= atomic_read(&ca->set->prio_blocked);

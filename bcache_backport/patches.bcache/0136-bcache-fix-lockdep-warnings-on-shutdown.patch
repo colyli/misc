@@ -1,0 +1,36 @@
+From e5112201c1285841f8b565ece5d6ae7e0d7947a2 Mon Sep 17 00:00:00 2001
+From: Slava Pestov <sp@daterainc.com>
+Date: Tue, 29 Apr 2014 15:39:27 -0700
+Subject: [PATCH 060624/122806] bcache: fix lockdep warnings on shutdown
+
+---
+ drivers/md/bcache/super.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 1ea9fa2..09573c2 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1214,7 +1214,9 @@ void bch_flash_dev_release(struct kobject *kobj)
+ static void flash_dev_free(struct closure *cl)
+ {
+ 	struct bcache_device *d = container_of(cl, struct bcache_device, cl);
++	mutex_lock(&bch_register_lock);
+ 	bcache_device_free(d);
++	mutex_unlock(&bch_register_lock);
+ 	kobject_put(&d->kobj);
+ }
+ 
+@@ -1222,7 +1224,9 @@ static void flash_dev_flush(struct closure *cl)
+ {
+ 	struct bcache_device *d = container_of(cl, struct bcache_device, cl);
+ 
++	mutex_lock(&bch_register_lock);
+ 	bcache_device_unlink(d);
++	mutex_unlock(&bch_register_lock);
+ 	kobject_del(&d->kobj);
+ 	continue_at(cl, flash_dev_free, system_wq);
+ }
+-- 
+2.6.2
+

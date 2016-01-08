@@ -1,0 +1,279 @@
+From c2f95ae2ebbe1ab61b1d4437f5923fdf720d4d4d Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 24 Jul 2013 17:24:25 -0700
+Subject: [PATCH 009443/122806] bcache: Clean up keylist code
+
+More random refactoring.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c    | 44 +++++++++++++++-----------------------------
+ drivers/md/bcache/bset.h    | 35 ++++++++++++++++++++++++++---------
+ drivers/md/bcache/btree.c   | 12 ++++++------
+ drivers/md/bcache/journal.c | 14 ++++++++------
+ drivers/md/bcache/request.c |  4 ++--
+ 5 files changed, 57 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index 830eede..d0512e4 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -14,22 +14,12 @@
+ 
+ /* Keylists */
+ 
+-void bch_keylist_copy(struct keylist *dest, struct keylist *src)
+-{
+-	*dest = *src;
+-
+-	if (src->list == src->d) {
+-		size_t n = (uint64_t *) src->top - src->d;
+-		dest->top = (struct bkey *) &dest->d[n];
+-		dest->list = dest->d;
+-	}
+-}
+-
+ int bch_keylist_realloc(struct keylist *l, int nptrs, struct cache_set *c)
+ {
+-	unsigned oldsize = (uint64_t *) l->top - l->list;
+-	unsigned newsize = oldsize + 2 + nptrs;
+-	uint64_t *new;
++	size_t oldsize = bch_keylist_nkeys(l);
++	size_t newsize = oldsize + 2 + nptrs;
++	uint64_t *old_keys = l->keys_p == l->inline_keys ? NULL : l->keys_p;
++	uint64_t *new_keys;
+ 
+ 	/* The journalling code doesn't handle the case where the keys to insert
+ 	 * is bigger than an empty write: If we just return -ENOMEM here,
+@@ -45,24 +35,23 @@ int bch_keylist_realloc(struct keylist *l, int nptrs, struct cache_set *c)
+ 	    roundup_pow_of_two(oldsize) == newsize)
+ 		return 0;
+ 
+-	new = krealloc(l->list == l->d ? NULL : l->list,
+-		       sizeof(uint64_t) * newsize, GFP_NOIO);
++	new_keys = krealloc(old_keys, sizeof(uint64_t) * newsize, GFP_NOIO);
+ 
+-	if (!new)
++	if (!new_keys)
+ 		return -ENOMEM;
+ 
+-	if (l->list == l->d)
+-		memcpy(new, l->list, sizeof(uint64_t) * KEYLIST_INLINE);
++	if (!old_keys)
++		memcpy(new_keys, l->inline_keys, sizeof(uint64_t) * oldsize);
+ 
+-	l->list = new;
+-	l->top = (struct bkey *) (&l->list[oldsize]);
++	l->keys_p = new_keys;
++	l->top_p = new_keys + oldsize;
+ 
+ 	return 0;
+ }
+ 
+ struct bkey *bch_keylist_pop(struct keylist *l)
+ {
+-	struct bkey *k = l->bottom;
++	struct bkey *k = l->keys;
+ 
+ 	if (k == l->top)
+ 		return NULL;
+@@ -75,14 +64,11 @@ struct bkey *bch_keylist_pop(struct keylist *l)
+ 
+ void bch_keylist_pop_front(struct keylist *l)
+ {
+-	struct bkey *next = bkey_next(l->bottom);
+-	size_t bytes = ((void *) l->top) - ((void *) next);
+-
+-	memmove(l->bottom,
+-		next,
+-		bytes);
++	l->top_p -= bkey_u64s(l->keys);
+ 
+-	l->top = ((void *) l->bottom) + bytes;
++	memmove(l->keys,
++		bkey_next(l->keys),
++		bch_keylist_bytes(l));
+ }
+ 
+ /* Pointer validation */
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index a3627d0..8a93056 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -227,20 +227,23 @@ static inline struct bkey *bkey_next(const struct bkey *k)
+ /* Keylists */
+ 
+ struct keylist {
+-	struct bkey		*top;
+ 	union {
+-		uint64_t		*list;
+-		struct bkey		*bottom;
++		struct bkey		*keys;
++		uint64_t		*keys_p;
++	};
++	union {
++		struct bkey		*top;
++		uint64_t		*top_p;
+ 	};
+ 
+ 	/* Enough room for btree_split's keys without realloc */
+ #define KEYLIST_INLINE		16
+-	uint64_t		d[KEYLIST_INLINE];
++	uint64_t		inline_keys[KEYLIST_INLINE];
+ };
+ 
+ static inline void bch_keylist_init(struct keylist *l)
+ {
+-	l->top = (void *) (l->list = l->d);
++	l->top_p = l->keys_p = l->inline_keys;
+ }
+ 
+ static inline void bch_keylist_push(struct keylist *l)
+@@ -256,16 +259,30 @@ static inline void bch_keylist_add(struct keylist *l, struct bkey *k)
+ 
+ static inline bool bch_keylist_empty(struct keylist *l)
+ {
+-	return l->top == (void *) l->list;
++	return l->top == l->keys;
++}
++
++static inline void bch_keylist_reset(struct keylist *l)
++{
++	l->top = l->keys;
+ }
+ 
+ static inline void bch_keylist_free(struct keylist *l)
+ {
+-	if (l->list != l->d)
+-		kfree(l->list);
++	if (l->keys_p != l->inline_keys)
++		kfree(l->keys_p);
++}
++
++static inline size_t bch_keylist_nkeys(struct keylist *l)
++{
++	return l->top_p - l->keys_p;
++}
++
++static inline size_t bch_keylist_bytes(struct keylist *l)
++{
++	return bch_keylist_nkeys(l) * sizeof(uint64_t);
+ }
+ 
+-void bch_keylist_copy(struct keylist *, struct keylist *);
+ struct bkey *bch_keylist_pop(struct keylist *);
+ void bch_keylist_pop_front(struct keylist *);
+ int bch_keylist_realloc(struct keylist *, int, struct cache_set *);
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index fc3cae5..f960607 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -1866,7 +1866,7 @@ static bool bch_btree_insert_keys(struct btree *b, struct btree_op *op,
+ 
+ 	while (!bch_keylist_empty(insert_keys)) {
+ 		struct bset *i = write_block(b);
+-		struct bkey *k = insert_keys->bottom;
++		struct bkey *k = insert_keys->keys;
+ 
+ 		if (b->written + __set_blocks(i, i->keys + bkey_u64s(k), b->c)
+ 		    > btree_blocks(b))
+@@ -1887,10 +1887,10 @@ static bool bch_btree_insert_keys(struct btree *b, struct btree_op *op,
+ 			}
+ #endif
+ 			BKEY_PADDED(key) temp;
+-			bkey_copy(&temp.key, insert_keys->bottom);
++			bkey_copy(&temp.key, insert_keys->keys);
+ 
+ 			bch_cut_back(&b->key, &temp.key);
+-			bch_cut_front(&b->key, insert_keys->bottom);
++			bch_cut_front(&b->key, insert_keys->keys);
+ 
+ 			ret |= btree_insert_key(b, op, &temp.key);
+ 			break;
+@@ -1984,7 +1984,7 @@ static int btree_split(struct btree *b, struct btree_op *op,
+ 	} else if (!b->parent) {
+ 		/* Root filled up but didn't need to be split */
+ 
+-		parent_keys->top = parent_keys->bottom;
++		bch_keylist_reset(parent_keys);
+ 		closure_sync(&op->cl);
+ 		bch_btree_set_root(n1);
+ 	} else {
+@@ -2118,12 +2118,12 @@ static int bch_btree_insert_recurse(struct btree *b, struct btree_op *op,
+ 	if (b->level) {
+ 		struct bkey *k;
+ 
+-		k = bch_next_recurse_key(b, &START_KEY(keys->bottom));
++		k = bch_next_recurse_key(b, &START_KEY(keys->keys));
+ 		if (!k) {
+ 			btree_bug(b, "no key to recurse on at level %i/%i",
+ 				  b->level, b->c->root->level);
+ 
+-			keys->top = keys->bottom;
++			bch_keylist_reset(keys);
+ 			return -EIO;
+ 		}
+ 
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 5abe5d5..1bdefdb 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -713,7 +713,7 @@ void bch_journal(struct closure *cl)
+ 	struct btree_op *op = container_of(cl, struct btree_op, cl);
+ 	struct cache_set *c = op->c;
+ 	struct journal_write *w;
+-	size_t b, n = ((uint64_t *) op->keys.top) - op->keys.list;
++	size_t sectors, nkeys;
+ 
+ 	if (op->type != BTREE_INSERT ||
+ 	    !CACHE_SYNC(&c->sb))
+@@ -741,10 +741,12 @@ void bch_journal(struct closure *cl)
+ 	}
+ 
+ 	w = c->journal.cur;
+-	b = __set_blocks(w->data, w->data->keys + n, c);
++	nkeys = w->data->keys + bch_keylist_nkeys(&op->keys);
++	sectors = __set_blocks(w->data, nkeys, c) * c->sb.block_size;
+ 
+-	if (b * c->sb.block_size > PAGE_SECTORS << JSET_BITS ||
+-	    b > c->journal.blocks_free) {
++	if (sectors > min_t(size_t,
++			    c->journal.blocks_free * c->sb.block_size,
++			    PAGE_SECTORS << JSET_BITS)) {
+ 		trace_bcache_journal_entry_full(c);
+ 
+ 		/*
+@@ -760,8 +762,8 @@ void bch_journal(struct closure *cl)
+ 		continue_at(cl, bch_journal, bcache_wq);
+ 	}
+ 
+-	memcpy(end(w->data), op->keys.list, n * sizeof(uint64_t));
+-	w->data->keys += n;
++	memcpy(end(w->data), op->keys.keys, bch_keylist_bytes(&op->keys));
++	w->data->keys += bch_keylist_nkeys(&op->keys);
+ 
+ 	op->journal = &fifo_back(&c->journal.pin);
+ 	atomic_inc(op->journal);
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 7fd84ce9..a000e91 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -438,13 +438,13 @@ static void bch_insert_data_error(struct closure *cl)
+ 	 * from the keys we'll accomplish just that.
+ 	 */
+ 
+-	struct bkey *src = op->keys.bottom, *dst = op->keys.bottom;
++	struct bkey *src = op->keys.keys, *dst = op->keys.keys;
+ 
+ 	while (src != op->keys.top) {
+ 		struct bkey *n = bkey_next(src);
+ 
+ 		SET_KEY_PTRS(src, 0);
+-		bkey_copy(dst, src);
++		memmove(dst, src, bkey_bytes(src));
+ 
+ 		dst = bkey_next(dst);
+ 		src = n;
+-- 
+2.6.2
+

@@ -1,0 +1,117 @@
+From 59158fde429fb5d18064e2734b3dd5e6048affbd Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 11 Nov 2013 19:03:54 -0800
+Subject: [PATCH 019182/122806] bcache: Add bch_btree_keys_u64s_remaining()
+
+Helper function to explicitly check how much space is free in a btree node
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.h    | 15 +++++++++++++++
+ drivers/md/bcache/btree.c   | 28 +++++++++++++++-------------
+ include/uapi/linux/bcache.h |  1 +
+ 3 files changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index 87da828..4fc40fd 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -260,6 +260,21 @@ static inline bool btree_keys_expensive_checks(struct btree_keys *b)
+ #define set_blocks(i, block_bytes)				\
+ 	__set_blocks(i, (i)->keys, block_bytes)
+ 
++static inline size_t bch_btree_keys_u64s_remaining(struct btree_keys *b)
++{
++	struct bset_tree *t = bset_tree_last(b);
++
++	BUG_ON((PAGE_SIZE << b->page_order) <
++	       (bset_byte_offset(b, t->data) + set_bytes(t->data)));
++
++	if (!b->last_set_unwritten)
++		return 0;
++
++	return ((PAGE_SIZE << b->page_order) -
++		(bset_byte_offset(b, t->data) + set_bytes(t->data))) /
++		sizeof(u64);
++}
++
+ static inline struct bset *bset_next_set(struct btree_keys *b,
+ 					 unsigned block_bytes)
+ {
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 5d7dee8..2c90003 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -179,14 +179,6 @@ static inline struct bset *write_block(struct btree *b)
+ 	return ((void *) btree_bset_first(b)) + b->written * block_bytes(b->c);
+ }
+ 
+-static inline bool should_split(struct btree *b)
+-{
+-	struct bset *i = write_block(b);
+-	return b->written >= btree_blocks(b) ||
+-		(b->written + __set_blocks(i, i->keys + 15, block_bytes(b->c))
+-		 > btree_blocks(b));
+-}
+-
+ /* Btree key manipulation */
+ 
+ void bkey_put(struct cache_set *c, struct bkey *k)
+@@ -2026,6 +2018,19 @@ merged:
+ 	return true;
+ }
+ 
++static size_t insert_u64s_remaining(struct btree *b)
++{
++	ssize_t ret = bch_btree_keys_u64s_remaining(&b->keys);
++
++	/*
++	 * Might land in the middle of an existing extent and have to split it
++	 */
++	if (b->keys.ops->is_extents)
++		ret -= KEY_MAX_U64S;
++
++	return max(ret, 0L);
++}
++
+ static bool bch_btree_insert_keys(struct btree *b, struct btree_op *op,
+ 				  struct keylist *insert_keys,
+ 				  struct bkey *replace_key)
+@@ -2034,12 +2039,9 @@ static bool bch_btree_insert_keys(struct btree *b, struct btree_op *op,
+ 	int oldsize = bch_count_data(b);
+ 
+ 	while (!bch_keylist_empty(insert_keys)) {
+-		struct bset *i = write_block(b);
+ 		struct bkey *k = insert_keys->keys;
+ 
+-		if (b->written +
+-		    __set_blocks(i, i->keys + bkey_u64s(k),
+-				 block_bytes(b->c)) > btree_blocks(b))
++		if (bkey_u64s(k) > insert_u64s_remaining(b))
+ 			break;
+ 
+ 		if (bkey_cmp(k, &b->key) <= 0) {
+@@ -2203,7 +2205,7 @@ static int bch_btree_insert_node(struct btree *b, struct btree_op *op,
+ {
+ 	BUG_ON(b->level && replace_key);
+ 
+-	if (should_split(b)) {
++	if (bch_keylist_nkeys(insert_keys) > insert_u64s_remaining(b)) {
+ 		if (current->bio_list) {
+ 			op->lock = b->c->root->level + 1;
+ 			return -EAGAIN;
+diff --git a/include/uapi/linux/bcache.h b/include/uapi/linux/bcache.h
+index ae66311..22b6ad3 100644
+--- a/include/uapi/linux/bcache.h
++++ b/include/uapi/linux/bcache.h
+@@ -39,6 +39,7 @@ static inline void SET_##name(struct bkey *k, unsigned i, __u64 v)	\
+ }
+ 
+ #define KEY_SIZE_BITS		16
++#define KEY_MAX_U64S		8
+ 
+ KEY_FIELD(KEY_PTRS,	high, 60, 3)
+ KEY_FIELD(HEADER_SIZE,	high, 58, 2)
+-- 
+2.6.2
+

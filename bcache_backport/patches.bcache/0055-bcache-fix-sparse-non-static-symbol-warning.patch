@@ -1,0 +1,32 @@
+From 08239ca2a053dbc3b082916bdfbd88e5a9ad9267 Mon Sep 17 00:00:00 2001
+From: Wei Yongjun <yongjun_wei@trendmicro.com.cn>
+Date: Thu, 28 Nov 2013 10:31:35 +0800
+Subject: [PATCH 012137/122806] bcache: fix sparse non static symbol warning
+
+Fixes the following sparse warning:
+
+drivers/md/bcache/btree.c:2220:5: warning:
+ symbol 'btree_insert_fn' was not declared. Should it be static?
+
+Signed-off-by: Wei Yongjun <yongjun_wei@trendmicro.com.cn>
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 5e2765a..dc6e2be 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -2217,7 +2217,7 @@ struct btree_insert_op {
+ 	struct bkey	*replace_key;
+ };
+ 
+-int btree_insert_fn(struct btree_op *b_op, struct btree *b)
++static int btree_insert_fn(struct btree_op *b_op, struct btree *b)
+ {
+ 	struct btree_insert_op *op = container_of(b_op,
+ 					struct btree_insert_op, op);
+-- 
+2.6.2
+

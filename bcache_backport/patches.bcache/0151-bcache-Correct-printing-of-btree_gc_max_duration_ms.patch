@@ -1,0 +1,34 @@
+From 5b25abade29616d42d60f9bd5e6a5ad07f7314e3 Mon Sep 17 00:00:00 2001
+From: Surbhi Palande <sap@daterainc.com>
+Date: Thu, 17 Apr 2014 12:07:04 -0700
+Subject: [PATCH 060639/122806] bcache: Correct printing of
+ btree_gc_max_duration_ms
+
+time_stats::btree_gc_max_duration_mc is not bit shifted by 8
+
+Fixes BUG #138
+
+Change-Id: I44fc6e1d0579674016acc533f1a546b080e5371a
+Signed-off-by: Surbhi Palande <sap@daterainc.com>
+---
+ drivers/md/bcache/util.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/bcache/util.h b/drivers/md/bcache/util.h
+index ac7d0d1..98df757 100644
+--- a/drivers/md/bcache/util.h
++++ b/drivers/md/bcache/util.h
+@@ -416,8 +416,8 @@ do {									\
+ 			  average_frequency,	frequency_units);	\
+ 	__print_time_stat(stats, name,					\
+ 			  average_duration,	duration_units);	\
+-	__print_time_stat(stats, name,					\
+-			  max_duration,		duration_units);	\
++	sysfs_print(name ## _ ##max_duration ## _ ## duration_units,	\
++			div_u64((stats)->max_duration, NSEC_PER_ ## duration_units));\
+ 									\
+ 	sysfs_print(name ## _last_ ## frequency_units, (stats)->last	\
+ 		    ? div_s64(local_clock() - (stats)->last,		\
+-- 
+2.6.2
+

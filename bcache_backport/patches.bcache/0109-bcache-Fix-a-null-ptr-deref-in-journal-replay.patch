@@ -1,0 +1,32 @@
+From 65ddf45a3102916fb622c71f7af158b19d49dc7f Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 24 Feb 2014 19:55:28 -0800
+Subject: [PATCH 032763/122806] bcache: Fix a null ptr deref in journal replay
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/journal.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index e38c599..97e6a92 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -287,9 +287,13 @@ void bch_journal_mark(struct cache_set *c, struct list_head *list)
+ 		     k < bset_bkey_last(&i->j);
+ 		     k = bkey_next(k)) {
+ 			unsigned j;
++			struct bucket *g;
+ 
+ 			for (j = 0; j < KEY_PTRS(k); j++) {
+-				struct bucket *g = PTR_BUCKET(c, k, j);
++				if (!ptr_available(c, k, j))
++					continue;
++
++				g = PTR_BUCKET(c, k, j);
+ 				atomic_inc(&g->pin);
+ 
+ 				if (g->prio == BTREE_PRIO &&
+-- 
+2.6.2
+

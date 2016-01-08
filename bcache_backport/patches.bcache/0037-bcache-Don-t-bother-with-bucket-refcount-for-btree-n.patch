@@ -1,0 +1,183 @@
+From 3a3b6a4e075188342b58d4b6560f5540af64cac0 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 24 Jul 2013 16:46:42 -0700
+Subject: [PATCH 009467/122806] bcache: Don't bother with bucket refcount for
+ btree node allocations
+
+The bucket refcount (dropped with bkey_put()) is only needed to prevent
+the newly allocated bucket from being garbage collected until we've
+added a pointer to it somewhere. But for btree node allocations, the
+fact that we have btree nodes locked is enough to guard against races
+with garbage collection.
+
+Eventually the per bucket refcount is going to be replaced with
+something specific to bch_alloc_sectors().
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/alloc.c |  4 ++--
+ drivers/md/bcache/btree.c | 28 +++++-----------------------
+ drivers/md/bcache/btree.h |  2 +-
+ drivers/md/bcache/super.c |  2 +-
+ 4 files changed, 9 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/md/bcache/alloc.c b/drivers/md/bcache/alloc.c
+index ed5920b..2b46bf1 100644
+--- a/drivers/md/bcache/alloc.c
++++ b/drivers/md/bcache/alloc.c
+@@ -472,7 +472,7 @@ int __bch_bucket_alloc_set(struct cache_set *c, unsigned watermark,
+ 	return 0;
+ err:
+ 	bch_bucket_free(c, k);
+-	__bkey_put(c, k);
++	bkey_put(c, k);
+ 	return -1;
+ }
+ 
+@@ -588,7 +588,7 @@ bool bch_alloc_sectors(struct cache_set *c, struct bkey *k, unsigned sectors,
+ 	 * didn't use it, drop the refcount bch_bucket_alloc_set() took:
+ 	 */
+ 	if (KEY_PTRS(&alloc.key))
+-		__bkey_put(c, &alloc.key);
++		bkey_put(c, &alloc.key);
+ 
+ 	for (i = 0; i < KEY_PTRS(&b->key); i++)
+ 		EBUG_ON(ptr_stale(c, &b->key, i));
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index fa4d0b1..7dff73b 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -180,7 +180,7 @@ static inline bool should_split(struct btree *b)
+ 
+ /* Btree key manipulation */
+ 
+-void __bkey_put(struct cache_set *c, struct bkey *k)
++void bkey_put(struct cache_set *c, struct bkey *k)
+ {
+ 	unsigned i;
+ 
+@@ -189,12 +189,6 @@ void __bkey_put(struct cache_set *c, struct bkey *k)
+ 			atomic_dec_bug(&PTR_BUCKET(c, k, i)->pin);
+ }
+ 
+-static void bkey_put(struct cache_set *c, struct bkey *k, int level)
+-{
+-	if ((level && KEY_OFFSET(k)) || !level)
+-		__bkey_put(c, k);
+-}
+-
+ /* Btree IO */
+ 
+ static uint64_t btree_csum_set(struct btree *b, struct bset *i)
+@@ -1068,6 +1062,7 @@ retry:
+ 	if (__bch_bucket_alloc_set(c, WATERMARK_METADATA, &k.key, 1, true))
+ 		goto err;
+ 
++	bkey_put(c, &k.key);
+ 	SET_KEY_SIZE(&k.key, c->btree_pages * PAGE_SECTORS);
+ 
+ 	b = mca_alloc(c, &k.key, level);
+@@ -1077,7 +1072,6 @@ retry:
+ 	if (!b) {
+ 		cache_bug(c,
+ 			"Tried to allocate bucket that was in btree cache");
+-		__bkey_put(c, &k.key);
+ 		goto retry;
+ 	}
+ 
+@@ -1090,7 +1084,6 @@ retry:
+ 	return b;
+ err_free:
+ 	bch_bucket_free(c, &k.key);
+-	__bkey_put(c, &k.key);
+ err:
+ 	mutex_unlock(&c->bucket_lock);
+ 
+@@ -1217,7 +1210,6 @@ static struct btree *btree_gc_alloc(struct btree *b, struct bkey *k)
+ 
+ 	if (!IS_ERR_OR_NULL(n)) {
+ 		swap(b, n);
+-		__bkey_put(b->c, &b->key);
+ 
+ 		memcpy(k->ptr, b->key.ptr,
+ 		       sizeof(uint64_t) * KEY_PTRS(&b->key));
+@@ -1932,19 +1924,12 @@ static bool bch_btree_insert_keys(struct btree *b, struct btree_op *op,
+ 			break;
+ 
+ 		if (bkey_cmp(k, &b->key) <= 0) {
+-			bkey_put(b->c, k, b->level);
++			if (!b->level)
++				bkey_put(b->c, k);
+ 
+ 			ret |= btree_insert_key(b, op, k, replace_key);
+ 			bch_keylist_pop_front(insert_keys);
+ 		} else if (bkey_cmp(&START_KEY(k), &b->key) < 0) {
+-#if 0
+-			if (replace_key) {
+-				bkey_put(b->c, k, b->level);
+-				bch_keylist_pop_front(insert_keys);
+-				op->insert_collision = true;
+-				break;
+-			}
+-#endif
+ 			BKEY_PADDED(key) temp;
+ 			bkey_copy(&temp.key, insert_keys->keys);
+ 
+@@ -2071,11 +2056,9 @@ static int btree_split(struct btree *b, struct btree_op *op,
+ 
+ 	return 0;
+ err_free2:
+-	__bkey_put(n2->c, &n2->key);
+ 	btree_node_free(n2);
+ 	rw_unlock(true, n2);
+ err_free1:
+-	__bkey_put(n1->c, &n1->key);
+ 	btree_node_free(n1);
+ 	rw_unlock(true, n1);
+ err:
+@@ -2225,7 +2208,7 @@ int bch_btree_insert(struct cache_set *c, struct keylist *keys,
+ 		pr_err("error %i", ret);
+ 
+ 		while ((k = bch_keylist_pop(keys)))
+-			bkey_put(c, k, 0);
++			bkey_put(c, k);
+ 	} else if (op.op.insert_collision)
+ 		ret = -ESRCH;
+ 
+@@ -2251,7 +2234,6 @@ void bch_btree_set_root(struct btree *b)
+ 	mutex_unlock(&b->c->bucket_lock);
+ 
+ 	b->c->root = b;
+-	__bkey_put(b->c, &b->key);
+ 
+ 	bch_journal_meta(b->c, &cl);
+ 	closure_sync(&cl);
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 27e90b1..d4b705e 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -216,7 +216,7 @@ static inline struct bkey *bch_btree_iter_init(struct btree *b,
+ 	return __bch_btree_iter_init(b, iter, search, b->sets);
+ }
+ 
+-void __bkey_put(struct cache_set *c, struct bkey *k);
++void bkey_put(struct cache_set *c, struct bkey *k);
+ 
+ /* Looping macros */
+ 
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index c67d19a..05f8ccb 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -426,7 +426,7 @@ static int __uuid_write(struct cache_set *c)
+ 	closure_sync(&cl);
+ 
+ 	bkey_copy(&c->uuid_bucket, &k.key);
+-	__bkey_put(c, &k.key);
++	bkey_put(c, &k.key);
+ 	return 0;
+ }
+ 
+-- 
+2.6.2
+

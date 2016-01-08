@@ -1,0 +1,68 @@
+From 958b43384e41c129117284f48ba3fb9c11ebac75 Mon Sep 17 00:00:00 2001
+From: Pekka Enberg <penberg@kernel.org>
+Date: Tue, 30 Jun 2015 14:59:30 -0700
+Subject: [PATCH 121471/122806] bcache: use kvfree() in various places
+
+Use kvfree() instead of open-coding it.
+
+Signed-off-by: Pekka Enberg <penberg@kernel.org>
+Cc: Kent Overstreet <kmo@daterainc.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ drivers/md/bcache/super.c | 10 ++--------
+ drivers/md/bcache/util.h  | 10 ++--------
+ 2 files changed, 4 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 4dd2bb7..94980bf 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -760,14 +760,8 @@ static void bcache_device_free(struct bcache_device *d)
+ 	bio_split_pool_free(&d->bio_split_hook);
+ 	if (d->bio_split)
+ 		bioset_free(d->bio_split);
+-	if (is_vmalloc_addr(d->full_dirty_stripes))
+-		vfree(d->full_dirty_stripes);
+-	else
+-		kfree(d->full_dirty_stripes);
+-	if (is_vmalloc_addr(d->stripe_sectors_dirty))
+-		vfree(d->stripe_sectors_dirty);
+-	else
+-		kfree(d->stripe_sectors_dirty);
++	kvfree(d->full_dirty_stripes);
++	kvfree(d->stripe_sectors_dirty);
+ 
+ 	closure_debug_destroy(&d->cl);
+ }
+diff --git a/drivers/md/bcache/util.h b/drivers/md/bcache/util.h
+index 98df757..1d04c48 100644
+--- a/drivers/md/bcache/util.h
++++ b/drivers/md/bcache/util.h
+@@ -52,10 +52,7 @@ struct closure;
+ 
+ #define free_heap(heap)							\
+ do {									\
+-	if (is_vmalloc_addr((heap)->data))				\
+-		vfree((heap)->data);					\
+-	else								\
+-		kfree((heap)->data);					\
++	kvfree((heap)->data);						\
+ 	(heap)->data = NULL;						\
+ } while (0)
+ 
+@@ -163,10 +160,7 @@ do {									\
+ 
+ #define free_fifo(fifo)							\
+ do {									\
+-	if (is_vmalloc_addr((fifo)->data))				\
+-		vfree((fifo)->data);					\
+-	else								\
+-		kfree((fifo)->data);					\
++	kvfree((fifo)->data);						\
+ 	(fifo)->data = NULL;						\
+ } while (0)
+ 
+-- 
+2.6.2
+

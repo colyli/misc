@@ -1,0 +1,74 @@
+From 3bdad1e40d11aad31f2322f21e943c31ef20d9da Mon Sep 17 00:00:00 2001
+From: Nicholas Swenson <nks@daterainc.com>
+Date: Mon, 11 Nov 2013 19:36:25 -0800
+Subject: [PATCH 019189/122806] bcache: Add bch_bkey_equal_header()
+
+Checks if two keys have equivalent header fields.
+(good enough for replacement or merging)
+
+Used in bch_bkey_try_merge, and replacing a key
+in the btree.
+
+Signed-off-by: Nicholas Swenson <nks@daterainc.com>
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c    | 8 ++------
+ drivers/md/bcache/bset.h    | 8 ++++++++
+ drivers/md/bcache/extents.c | 3 +--
+ 3 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index 7f8a7bd..f990403 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -788,12 +788,8 @@ bool bch_bkey_try_merge(struct btree_keys *b, struct bkey *l, struct bkey *r)
+ 	 * Assumes left and right are in order
+ 	 * Left and right must be exactly aligned
+ 	 */
+-	if (KEY_U64s(l) != KEY_U64s(r) ||
+-	    KEY_DELETED(l) != KEY_DELETED(r) ||
+-	    KEY_CACHED(l) != KEY_CACHED(r) ||
+-	    KEY_VERSION(l) != KEY_VERSION(r) ||
+-	    KEY_CSUM(l) != KEY_CSUM(r) ||
+-	    bkey_cmp(l, &START_KEY(r)))
++	if (!bch_bkey_equal_header(l, r) ||
++	     bkey_cmp(l, &START_KEY(r)))
+ 		return false;
+ 
+ 	return b->ops->key_merge(b, l, r);
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index 4873730..003260f 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -448,6 +448,14 @@ static inline void bch_bkey_to_text(struct btree_keys *b, char *buf,
+ 	return b->ops->key_to_text(buf, size, k);
+ }
+ 
++static inline bool bch_bkey_equal_header(const struct bkey *l,
++					 const struct bkey *r)
++{
++	return (KEY_DIRTY(l) == KEY_DIRTY(r) &&
++		KEY_PTRS(l) == KEY_PTRS(r) &&
++		KEY_CSUM(l) == KEY_CSUM(l));
++}
++
+ /* Keylists */
+ 
+ struct keylist {
+diff --git a/drivers/md/bcache/extents.c b/drivers/md/bcache/extents.c
+index 7d73d86..c3ead58 100644
+--- a/drivers/md/bcache/extents.c
++++ b/drivers/md/bcache/extents.c
+@@ -372,8 +372,7 @@ static bool bch_extent_insert_fixup(struct btree_keys *b,
+ 			if (KEY_START(k) > KEY_START(insert) + sectors_found)
+ 				goto check_failed;
+ 
+-			if (KEY_PTRS(k) != KEY_PTRS(replace_key) ||
+-			    KEY_DIRTY(k) != KEY_DIRTY(replace_key))
++			if (!bch_bkey_equal_header(k, replace_key))
+ 				goto check_failed;
+ 
+ 			/* skip past gen */
+-- 
+2.6.2
+

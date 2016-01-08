@@ -1,0 +1,30 @@
+From 3f6ef38110b6955327fea3105f004a3b61a3f65f Mon Sep 17 00:00:00 2001
+From: Nicholas Swenson <nks@daterainc.com>
+Date: Thu, 23 Jan 2014 15:21:02 -0800
+Subject: [PATCH 032953/122806] bcache: stop moving_gc marking buckets that
+ can't be moved.
+
+Signed-off-by: Nicholas Swenson <nks@daterainc.com>
+---
+ drivers/md/bcache/movinggc.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/movinggc.c b/drivers/md/bcache/movinggc.c
+index 5e8e587..cd74903 100644
+--- a/drivers/md/bcache/movinggc.c
++++ b/drivers/md/bcache/movinggc.c
+@@ -215,7 +215,10 @@ void bch_moving_gc(struct cache_set *c)
+ 		ca->heap.used = 0;
+ 
+ 		for_each_bucket(b, ca) {
+-			if (!GC_SECTORS_USED(b))
++			if (GC_MARK(b) == GC_MARK_METADATA ||
++			    !GC_SECTORS_USED(b) ||
++			    GC_SECTORS_USED(b) == ca->sb.bucket_size ||
++			    atomic_read(&b->pin))
+ 				continue;
+ 
+ 			if (!heap_full(&ca->heap)) {
+-- 
+2.6.2
+

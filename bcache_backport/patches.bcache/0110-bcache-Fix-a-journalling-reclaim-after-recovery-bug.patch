@@ -1,0 +1,39 @@
+From 27201cfdaa2aeb571191494c1bae6863ffb04108 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 13 Mar 2014 13:44:21 -0700
+Subject: [PATCH 032945/122806] bcache: Fix a journalling reclaim after
+ recovery bug
+
+On recovery we weren't correctly keeping track of what journal buckets had open
+journal entries, thus it was possible for them to be overwritten until we'd
+written all new journal entries.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/journal.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 97e6a92..4152a91 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -237,8 +237,14 @@ bsearch:
+ 		for (i = 0; i < ca->sb.njournal_buckets; i++)
+ 			if (ja->seq[i] > seq) {
+ 				seq = ja->seq[i];
+-				ja->cur_idx = ja->discard_idx =
+-					ja->last_idx = i;
++				/*
++				 * When journal_reclaim() goes to allocate for
++				 * the first time, it'll use the bucket after
++				 * ja->cur_idx
++				 */
++				ja->cur_idx = i;
++				ja->last_idx = ja->discard_idx = (i + 1) %
++					ca->sb.njournal_buckets;
+ 
+ 			}
+ 	}
+-- 
+2.6.2
+

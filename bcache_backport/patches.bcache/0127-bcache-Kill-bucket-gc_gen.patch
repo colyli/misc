@@ -1,0 +1,114 @@
+From 3a2fd9d5090b83aab85378a846fa10f39b0b5aa7 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 27 Feb 2014 17:51:12 -0800
+Subject: [PATCH 032965/122806] bcache: Kill bucket->gc_gen
+
+gc_gen was a temporary used to recalculate last_gc, but since we only need
+bucket->last_gc when gc isn't running (gc_mark_valid = 1), we can just update
+last_gc directly.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h  | 3 +--
+ drivers/md/bcache/btree.c   | 7 +++----
+ drivers/md/bcache/extents.c | 8 ++++----
+ drivers/md/bcache/super.c   | 2 +-
+ 4 files changed, 9 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 200efc1..82c9c5d 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -196,7 +196,6 @@ struct bucket {
+ 	uint16_t	prio;
+ 	uint8_t		gen;
+ 	uint8_t		last_gc; /* Most out of date gen in the btree */
+-	uint8_t		gc_gen;
+ 	uint16_t	gc_mark; /* Bitfield used by GC. See below for field */
+ };
+ 
+@@ -588,7 +587,7 @@ struct cache_set {
+ 	uint16_t		min_prio;
+ 
+ 	/*
+-	 * max(gen - gc_gen) for all buckets. When it gets too big we have to gc
++	 * max(gen - last_gc) for all buckets. When it gets too big we have to gc
+ 	 * to keep gens from wrapping around.
+ 	 */
+ 	uint8_t			need_gc;
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 4c340c8..7347b61 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -1178,8 +1178,8 @@ static uint8_t __bch_btree_mark_key(struct cache_set *c, int level,
+ 
+ 		g = PTR_BUCKET(c, k, i);
+ 
+-		if (gen_after(g->gc_gen, PTR_GEN(k, i)))
+-			g->gc_gen = PTR_GEN(k, i);
++		if (gen_after(g->last_gc, PTR_GEN(k, i)))
++			g->last_gc = PTR_GEN(k, i);
+ 
+ 		if (ptr_stale(c, k, i)) {
+ 			stale = max(stale, ptr_stale(c, k, i));
+@@ -1631,7 +1631,7 @@ static void btree_gc_start(struct cache_set *c)
+ 
+ 	for_each_cache(ca, c, i)
+ 		for_each_bucket(b, ca) {
+-			b->gc_gen = b->gen;
++			b->last_gc = b->gen;
+ 			if (!atomic_read(&b->pin)) {
+ 				SET_GC_MARK(b, 0);
+ 				SET_GC_SECTORS_USED(b, 0);
+@@ -1693,7 +1693,6 @@ static size_t bch_btree_gc_finish(struct cache_set *c)
+ 			SET_GC_MARK(ca->buckets + *i, GC_MARK_METADATA);
+ 
+ 		for_each_bucket(b, ca) {
+-			b->last_gc	= b->gc_gen;
+ 			c->need_gc	= max(c->need_gc, bucket_gc_gen(b));
+ 
+ 			if (atomic_read(&b->pin))
+diff --git a/drivers/md/bcache/extents.c b/drivers/md/bcache/extents.c
+index 82d5e32..3588733 100644
+--- a/drivers/md/bcache/extents.c
++++ b/drivers/md/bcache/extents.c
+@@ -194,9 +194,9 @@ err:
+ 	mutex_unlock(&b->c->bucket_lock);
+ 	bch_extent_to_text(buf, sizeof(buf), k);
+ 	btree_bug(b,
+-"inconsistent btree pointer %s: bucket %zi pin %i prio %i gen %i last_gc %i mark %llu gc_gen %i",
++"inconsistent btree pointer %s: bucket %zi pin %i prio %i gen %i last_gc %i mark %llu",
+ 		  buf, PTR_BUCKET_NR(b->c, k, i), atomic_read(&g->pin),
+-		  g->prio, g->gen, g->last_gc, GC_MARK(g), g->gc_gen);
++		  g->prio, g->gen, g->last_gc, GC_MARK(g));
+ 	return true;
+ }
+ 
+@@ -515,9 +515,9 @@ err:
+ 	mutex_unlock(&b->c->bucket_lock);
+ 	bch_extent_to_text(buf, sizeof(buf), k);
+ 	btree_bug(b,
+-"inconsistent extent pointer %s:\nbucket %zu pin %i prio %i gen %i last_gc %i mark %llu gc_gen %i",
++"inconsistent extent pointer %s:\nbucket %zu pin %i prio %i gen %i last_gc %i mark %llu",
+ 		  buf, PTR_BUCKET_NR(b->c, k, ptr), atomic_read(&g->pin),
+-		  g->prio, g->gen, g->last_gc, GC_MARK(g), g->gc_gen);
++		  g->prio, g->gen, g->last_gc, GC_MARK(g));
+ 	return true;
+ }
+ 
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index a8c57d5..926ded8 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -635,7 +635,7 @@ static void prio_read(struct cache *ca, uint64_t bucket)
+ 		}
+ 
+ 		b->prio = le16_to_cpu(d->prio);
+-		b->gen = b->last_gc = b->gc_gen = d->gen;
++		b->gen = b->last_gc = d->gen;
+ 	}
+ }
+ 
+-- 
+2.6.2
+

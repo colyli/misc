@@ -1,0 +1,52 @@
+From d56d000a1f424aa77538bd5aad18b43037ed20cc Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Fri, 9 Aug 2013 21:14:13 -0700
+Subject: [PATCH 019163/122806] bcache: Don't touch bucket gen for dirty ptrs
+
+Unnecessary since a bucket that has dirty pointers pointing to it can
+never be invalidated - and skipping it is a measurable performance
+boost, since the bucket gen will usually be a cache miss.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c    | 6 +++++-
+ drivers/md/bcache/request.c | 3 ++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index 1695870..e51a739 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -176,10 +176,14 @@ bool bch_ptr_bad(struct btree *b, const struct bkey *k)
+ 	    bch_ptr_invalid(b, k))
+ 		return true;
+ 
+-	for (i = 0; i < KEY_PTRS(k); i++) {
++	for (i = 0; i < KEY_PTRS(k); i++)
+ 		if (!ptr_available(b->c, k, i))
+ 			return true;
+ 
++	if (!expensive_debug_checks(b->c) && KEY_DIRTY(k))
++		return false;
++
++	for (i = 0; i < KEY_PTRS(k); i++) {
+ 		g = PTR_BUCKET(b->c, k, i);
+ 		stale = ptr_stale(b->c, k, i);
+ 
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 5878cdb..59b3d6d 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -630,7 +630,8 @@ static void bch_cache_read_endio(struct bio *bio, int error)
+ 
+ 	if (error)
+ 		s->iop.error = error;
+-	else if (ptr_stale(s->iop.c, &b->key, 0)) {
++	else if (!KEY_DIRTY(&b->key) &&
++		 ptr_stale(s->iop.c, &b->key, 0)) {
+ 		atomic_long_inc(&s->iop.c->cache_read_races);
+ 		s->iop.error = -EINTR;
+ 	}
+-- 
+2.6.2
+

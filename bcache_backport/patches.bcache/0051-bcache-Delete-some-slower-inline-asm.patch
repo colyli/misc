@@ -1,0 +1,41 @@
+From 098fb25498214069e6bbf908515f2952dd7654d0 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 21 Aug 2013 18:36:45 -0700
+Subject: [PATCH 009481/122806] bcache: Delete some slower inline asm
+
+Never saw a profile of bset_search_tree() where it wasn't bottlenecked
+on memory until I got my new Haswell machine, but when I tried it there
+it was suddenly burning 20% of the cpu in the inner loop on shrd...
+
+Turns out, the version of shrd that takes 64 bit operands has a 9 cycle
+latency. hah.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index 1457339..7d388b8 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -481,16 +481,8 @@ static struct bkey *table_to_bkey(struct bset_tree *t, unsigned cacheline)
+ 
+ static inline uint64_t shrd128(uint64_t high, uint64_t low, uint8_t shift)
+ {
+-#ifdef CONFIG_X86_64
+-	asm("shrd %[shift],%[high],%[low]"
+-	    : [low] "+Rm" (low)
+-	    : [high] "R" (high),
+-	    [shift] "ci" (shift)
+-	    : "cc");
+-#else
+ 	low >>= shift;
+ 	low  |= (high << 1) << (63U - shift);
+-#endif
+ 	return low;
+ }
+ 
+-- 
+2.6.2
+

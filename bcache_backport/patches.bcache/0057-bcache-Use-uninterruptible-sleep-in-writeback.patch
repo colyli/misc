@@ -1,0 +1,38 @@
+From ce2b3f595e1c56639085645e0130426e443008c0 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 28 Nov 2013 17:28:37 -0800
+Subject: [PATCH 015428/122806] bcache: Use uninterruptible sleep in writeback
+
+We're just waiting on kthread_should_stop(), nothing else, so
+interruptible sleep was wrong here.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/writeback.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index 484e57d..3cd931d 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -241,7 +241,7 @@ static void read_dirty(struct cached_dev *dc)
+ 		if (KEY_START(&w->key) != dc->last_read ||
+ 		    jiffies_to_msecs(delay) > 50)
+ 			while (!kthread_should_stop() && delay)
+-				delay = schedule_timeout_interruptible(delay);
++				delay = schedule_timeout_uninterruptible(delay);
+ 
+ 		dc->last_read	= KEY_OFFSET(&w->key);
+ 
+@@ -438,7 +438,7 @@ static int bch_writeback_thread(void *arg)
+ 			while (delay &&
+ 			       !kthread_should_stop() &&
+ 			       !test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags))
+-				delay = schedule_timeout_interruptible(delay);
++				delay = schedule_timeout_uninterruptible(delay);
+ 		}
+ 	}
+ 
+-- 
+2.6.2
+

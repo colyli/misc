@@ -1,0 +1,76 @@
+From 394ffa503bc40e32d7f54a9b817264e81ce131b4 Mon Sep 17 00:00:00 2001
+From: Gu Zheng <guz.fnst@cn.fujitsu.com>
+Date: Mon, 24 Nov 2014 11:05:22 +0800
+Subject: [PATCH] blk: introduce generic io stat accounting help function
+
+Many block drivers accounting io stat based on bio (e.g. NVMe...),
+the blk_account_io_start/end() which is based on request
+does not make sense to them, so here we introduce the similar help
+function named generic_start/end_io_acct base on raw sectors, and it can
+simplify some driver's open io accounting code.
+
+Signed-off-by: Gu Zheng <guz.fnst@cn.fujitsu.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+ block/bio.c         | 28 ++++++++++++++++++++++++++++
+ include/linux/bio.h |  5 +++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/fs/bio.c b/fs/bio.c
+index 3e6e198..3d4a072 100644
+--- a/fs/bio.c
++++ b/fs/bio.c
+@@ -1739,6 +1739,34 @@ void bio_check_pages_dirty(struct bio *bio)
+ 	}
+ }
+ 
++void generic_start_io_acct(int rw, unsigned long sectors,
++			   struct hd_struct *part)
++{
++	int cpu = part_stat_lock();
++
++	part_round_stats(cpu, part);
++	part_stat_inc(cpu, part, ios[rw]);
++	part_stat_add(cpu, part, sectors[rw], sectors);
++	part_inc_in_flight(part, rw);
++
++	part_stat_unlock();
++}
++EXPORT_SYMBOL(generic_start_io_acct);
++
++void generic_end_io_acct(int rw, struct hd_struct *part,
++			 unsigned long start_time)
++{
++	unsigned long duration = jiffies - start_time;
++	int cpu = part_stat_lock();
++
++	part_stat_add(cpu, part, ticks[rw], duration);
++	part_round_stats(cpu, part);
++	part_dec_in_flight(part, rw);
++
++	part_stat_unlock();
++}
++EXPORT_SYMBOL(generic_end_io_acct);
++
+ #if ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE
+ void bio_flush_dcache_pages(struct bio *bi)
+ {
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 7347f48..efead0b 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -443,6 +443,11 @@ extern struct bio *bio_copy_kern(struct request_queue *, void *, unsigned int,
+ extern void bio_set_pages_dirty(struct bio *bio);
+ extern void bio_check_pages_dirty(struct bio *bio);
+ 
++void generic_start_io_acct(int rw, unsigned long sectors,
++			   struct hd_struct *part);
++void generic_end_io_acct(int rw, struct hd_struct *part,
++			 unsigned long start_time);
++
+ #ifndef ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE
+ # error	"You should define ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE for your platform"
+ #endif
+-- 
+2.6.2
+

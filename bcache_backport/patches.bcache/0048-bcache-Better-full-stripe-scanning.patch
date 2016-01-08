@@ -1,0 +1,368 @@
+From 48a915a87f0bd98c3d68d029acf223a2e5116f07 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 31 Oct 2013 15:43:22 -0700
+Subject: [PATCH 009478/122806] bcache: Better full stripe scanning
+
+The old scanning-by-stripe code burned too much CPU, this should be
+better.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h    |  5 ++-
+ drivers/md/bcache/btree.c     | 19 +++++----
+ drivers/md/bcache/super.c     | 17 +++++++-
+ drivers/md/bcache/writeback.c | 94 ++++++++++++++++++++++++++-----------------
+ drivers/md/bcache/writeback.h | 21 ++++++----
+ include/trace/events/bcache.h | 29 +++++++++++++
+ 6 files changed, 128 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 816d079..ab0b215 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -237,7 +237,7 @@ struct keybuf {
+ 
+ 	struct rb_root		keys;
+ 
+-#define KEYBUF_NR		100
++#define KEYBUF_NR		500
+ 	DECLARE_ARRAY_ALLOCATOR(struct keybuf_key, freelist, KEYBUF_NR);
+ };
+ 
+@@ -273,9 +273,10 @@ struct bcache_device {
+ 	atomic_t		detaching;
+ 	int			flush_done;
+ 
+-	uint64_t		nr_stripes;
++	unsigned		nr_stripes;
+ 	unsigned		stripe_size;
+ 	atomic_t		*stripe_sectors_dirty;
++	unsigned long		*full_dirty_stripes;
+ 
+ 	unsigned long		sectors_dirty_last;
+ 	long			sectors_dirty_derivative;
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 6def7c9..5e2765a 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -2378,6 +2378,7 @@ static inline int keybuf_nonoverlapping_cmp(struct keybuf_key *l,
+ 
+ struct refill {
+ 	struct btree_op	op;
++	unsigned	nr_found;
+ 	struct keybuf	*buf;
+ 	struct bkey	*end;
+ 	keybuf_pred_fn	*pred;
+@@ -2414,6 +2415,8 @@ static int refill_keybuf_fn(struct btree_op *op, struct btree *b,
+ 
+ 		if (RB_INSERT(&buf->keys, w, node, keybuf_cmp))
+ 			array_free(&buf->freelist, w);
++		else
++			refill->nr_found++;
+ 
+ 		if (array_freelist_empty(&buf->freelist))
+ 			ret = MAP_DONE;
+@@ -2434,18 +2437,18 @@ void bch_refill_keybuf(struct cache_set *c, struct keybuf *buf,
+ 	cond_resched();
+ 
+ 	bch_btree_op_init(&refill.op, -1);
+-	refill.buf = buf;
+-	refill.end = end;
+-	refill.pred = pred;
++	refill.nr_found	= 0;
++	refill.buf	= buf;
++	refill.end	= end;
++	refill.pred	= pred;
+ 
+ 	bch_btree_map_keys(&refill.op, c, &buf->last_scanned,
+ 			   refill_keybuf_fn, MAP_END_KEY);
+ 
+-	pr_debug("found %s keys from %llu:%llu to %llu:%llu",
+-		 RB_EMPTY_ROOT(&buf->keys) ? "no" :
+-		 array_freelist_empty(&buf->freelist) ? "some" : "a few",
+-		 KEY_INODE(&start), KEY_OFFSET(&start),
+-		 KEY_INODE(&buf->last_scanned), KEY_OFFSET(&buf->last_scanned));
++	trace_bcache_keyscan(refill.nr_found,
++			     KEY_INODE(&start), KEY_OFFSET(&start),
++			     KEY_INODE(&buf->last_scanned),
++			     KEY_OFFSET(&buf->last_scanned));
+ 
+ 	spin_lock(&buf->lock);
+ 
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 4813ef6..43fcfe3 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -738,6 +738,10 @@ static void bcache_device_free(struct bcache_device *d)
+ 		mempool_destroy(d->unaligned_bvec);
+ 	if (d->bio_split)
+ 		bioset_free(d->bio_split);
++	if (is_vmalloc_addr(d->full_dirty_stripes))
++		vfree(d->full_dirty_stripes);
++	else
++		kfree(d->full_dirty_stripes);
+ 	if (is_vmalloc_addr(d->stripe_sectors_dirty))
+ 		vfree(d->stripe_sectors_dirty);
+ 	else
+@@ -757,8 +761,12 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
+ 
+ 	d->nr_stripes = DIV_ROUND_UP_ULL(sectors, d->stripe_size);
+ 
+-	if (!d->nr_stripes || d->nr_stripes > SIZE_MAX / sizeof(atomic_t))
++	if (!d->nr_stripes ||
++	    d->nr_stripes > INT_MAX ||
++	    d->nr_stripes > SIZE_MAX / sizeof(atomic_t)) {
++		pr_err("nr_stripes too large");
+ 		return -ENOMEM;
++	}
+ 
+ 	n = d->nr_stripes * sizeof(atomic_t);
+ 	d->stripe_sectors_dirty = n < PAGE_SIZE << 6
+@@ -767,6 +775,13 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
+ 	if (!d->stripe_sectors_dirty)
+ 		return -ENOMEM;
+ 
++	n = BITS_TO_LONGS(d->nr_stripes) * sizeof(unsigned long);
++	d->full_dirty_stripes = n < PAGE_SIZE << 6
++		? kzalloc(n, GFP_KERNEL)
++		: vzalloc(n);
++	if (!d->full_dirty_stripes)
++		return -ENOMEM;
++
+ 	if (!(d->bio_split = bioset_create(4, offsetof(struct bbio, bio))) ||
+ 	    !(d->unaligned_bvec = mempool_create_kmalloc_pool(1,
+ 				sizeof(struct bio_vec) * BIO_MAX_PAGES)) ||
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index ab0f6b4..22e21dc 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -292,14 +292,12 @@ void bcache_dev_sectors_dirty_add(struct cache_set *c, unsigned inode,
+ 				  uint64_t offset, int nr_sectors)
+ {
+ 	struct bcache_device *d = c->devices[inode];
+-	unsigned stripe_offset;
+-	uint64_t stripe = offset;
++	unsigned stripe_offset, stripe, sectors_dirty;
+ 
+ 	if (!d)
+ 		return;
+ 
+-	do_div(stripe, d->stripe_size);
+-
++	stripe = offset_to_stripe(d, offset);
+ 	stripe_offset = offset & (d->stripe_size - 1);
+ 
+ 	while (nr_sectors) {
+@@ -309,7 +307,16 @@ void bcache_dev_sectors_dirty_add(struct cache_set *c, unsigned inode,
+ 		if (nr_sectors < 0)
+ 			s = -s;
+ 
+-		atomic_add(s, d->stripe_sectors_dirty + stripe);
++		if (stripe >= d->nr_stripes)
++			return;
++
++		sectors_dirty = atomic_add_return(s,
++					d->stripe_sectors_dirty + stripe);
++		if (sectors_dirty == d->stripe_size)
++			set_bit(stripe, d->full_dirty_stripes);
++		else
++			clear_bit(stripe, d->full_dirty_stripes);
++
+ 		nr_sectors -= s;
+ 		stripe_offset = 0;
+ 		stripe++;
+@@ -321,59 +328,70 @@ static bool dirty_pred(struct keybuf *buf, struct bkey *k)
+ 	return KEY_DIRTY(k);
+ }
+ 
+-static bool dirty_full_stripe_pred(struct keybuf *buf, struct bkey *k)
++static void refill_full_stripes(struct cached_dev *dc)
+ {
+-	uint64_t stripe = KEY_START(k);
+-	unsigned nr_sectors = KEY_SIZE(k);
+-	struct cached_dev *dc = container_of(buf, struct cached_dev,
+-					     writeback_keys);
++	struct keybuf *buf = &dc->writeback_keys;
++	unsigned start_stripe, stripe, next_stripe;
++	bool wrapped = false;
++
++	stripe = offset_to_stripe(&dc->disk, KEY_OFFSET(&buf->last_scanned));
+ 
+-	if (!KEY_DIRTY(k))
+-		return false;
++	if (stripe >= dc->disk.nr_stripes)
++		stripe = 0;
+ 
+-	do_div(stripe, dc->disk.stripe_size);
++	start_stripe = stripe;
+ 
+ 	while (1) {
+-		if (atomic_read(dc->disk.stripe_sectors_dirty + stripe) ==
+-		    dc->disk.stripe_size)
+-			return true;
++		stripe = find_next_bit(dc->disk.full_dirty_stripes,
++				       dc->disk.nr_stripes, stripe);
+ 
+-		if (nr_sectors <= dc->disk.stripe_size)
+-			return false;
++		if (stripe == dc->disk.nr_stripes)
++			goto next;
+ 
+-		nr_sectors -= dc->disk.stripe_size;
+-		stripe++;
++		next_stripe = find_next_zero_bit(dc->disk.full_dirty_stripes,
++						 dc->disk.nr_stripes, stripe);
++
++		buf->last_scanned = KEY(dc->disk.id,
++					stripe * dc->disk.stripe_size, 0);
++
++		bch_refill_keybuf(dc->disk.c, buf,
++				  &KEY(dc->disk.id,
++				       next_stripe * dc->disk.stripe_size, 0),
++				  dirty_pred);
++
++		if (array_freelist_empty(&buf->freelist))
++			return;
++
++		stripe = next_stripe;
++next:
++		if (wrapped && stripe > start_stripe)
++			return;
++
++		if (stripe == dc->disk.nr_stripes) {
++			stripe = 0;
++			wrapped = true;
++		}
+ 	}
+ }
+ 
+ static bool refill_dirty(struct cached_dev *dc)
+ {
+ 	struct keybuf *buf = &dc->writeback_keys;
+-	bool searched_from_start = false;
+ 	struct bkey end = KEY(dc->disk.id, MAX_KEY_OFFSET, 0);
++	bool searched_from_start = false;
++
++	if (dc->partial_stripes_expensive) {
++		refill_full_stripes(dc);
++		if (array_freelist_empty(&buf->freelist))
++			return false;
++	}
+ 
+ 	if (bkey_cmp(&buf->last_scanned, &end) >= 0) {
+ 		buf->last_scanned = KEY(dc->disk.id, 0, 0);
+ 		searched_from_start = true;
+ 	}
+ 
+-	if (dc->partial_stripes_expensive) {
+-		uint64_t i;
+-
+-		for (i = 0; i < dc->disk.nr_stripes; i++)
+-			if (atomic_read(dc->disk.stripe_sectors_dirty + i) ==
+-			    dc->disk.stripe_size)
+-				goto full_stripes;
+-
+-		goto normal_refill;
+-full_stripes:
+-		searched_from_start = false;	/* not searching entire btree */
+-		bch_refill_keybuf(dc->disk.c, buf, &end,
+-				  dirty_full_stripe_pred);
+-	} else {
+-normal_refill:
+-		bch_refill_keybuf(dc->disk.c, buf, &end, dirty_pred);
+-	}
++	bch_refill_keybuf(dc->disk.c, buf, &end, dirty_pred);
+ 
+ 	return bkey_cmp(&buf->last_scanned, &end) >= 0 && searched_from_start;
+ }
+diff --git a/drivers/md/bcache/writeback.h b/drivers/md/bcache/writeback.h
+index 60516bf..fe7d9d5 100644
+--- a/drivers/md/bcache/writeback.h
++++ b/drivers/md/bcache/writeback.h
+@@ -14,22 +14,27 @@ static inline uint64_t bcache_dev_sectors_dirty(struct bcache_device *d)
+ 	return ret;
+ }
+ 
+-static inline bool bcache_dev_stripe_dirty(struct bcache_device *d,
++static inline unsigned offset_to_stripe(struct bcache_device *d,
++					uint64_t offset)
++{
++	do_div(offset, d->stripe_size);
++	return offset;
++}
++
++static inline bool bcache_dev_stripe_dirty(struct cached_dev *dc,
+ 					   uint64_t offset,
+ 					   unsigned nr_sectors)
+ {
+-	uint64_t stripe = offset;
+-
+-	do_div(stripe, d->stripe_size);
++	unsigned stripe = offset_to_stripe(&dc->disk, offset);
+ 
+ 	while (1) {
+-		if (atomic_read(d->stripe_sectors_dirty + stripe))
++		if (atomic_read(dc->disk.stripe_sectors_dirty + stripe))
+ 			return true;
+ 
+-		if (nr_sectors <= d->stripe_size)
++		if (nr_sectors <= dc->disk.stripe_size)
+ 			return false;
+ 
+-		nr_sectors -= d->stripe_size;
++		nr_sectors -= dc->disk.stripe_size;
+ 		stripe++;
+ 	}
+ }
+@@ -45,7 +50,7 @@ static inline bool should_writeback(struct cached_dev *dc, struct bio *bio,
+ 		return false;
+ 
+ 	if (dc->partial_stripes_expensive &&
+-	    bcache_dev_stripe_dirty(&dc->disk, bio->bi_sector,
++	    bcache_dev_stripe_dirty(dc, bio->bi_sector,
+ 				    bio_sectors(bio)))
+ 		return true;
+ 
+diff --git a/include/trace/events/bcache.h b/include/trace/events/bcache.h
+index 32c89b3..e2b9576 100644
+--- a/include/trace/events/bcache.h
++++ b/include/trace/events/bcache.h
+@@ -368,6 +368,35 @@ DEFINE_EVENT(btree_node, bcache_btree_set_root,
+ 	TP_ARGS(b)
+ );
+ 
++TRACE_EVENT(bcache_keyscan,
++	TP_PROTO(unsigned nr_found,
++		 unsigned start_inode, uint64_t start_offset,
++		 unsigned end_inode, uint64_t end_offset),
++	TP_ARGS(nr_found,
++		start_inode, start_offset,
++		end_inode, end_offset),
++
++	TP_STRUCT__entry(
++		__field(__u32,	nr_found			)
++		__field(__u32,	start_inode			)
++		__field(__u64,	start_offset			)
++		__field(__u32,	end_inode			)
++		__field(__u64,	end_offset			)
++	),
++
++	TP_fast_assign(
++		__entry->nr_found	= nr_found;
++		__entry->start_inode	= start_inode;
++		__entry->start_offset	= start_offset;
++		__entry->end_inode	= end_inode;
++		__entry->end_offset	= end_offset;
++	),
++
++	TP_printk("found %u keys from %u:%llu to %u:%llu", __entry->nr_found,
++		  __entry->start_inode, __entry->start_offset,
++		  __entry->end_inode, __entry->end_offset)
++);
++
+ /* Allocator */
+ 
+ TRACE_EVENT(bcache_alloc_invalidate,
+-- 
+2.6.2
+

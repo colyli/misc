@@ -1,0 +1,120 @@
+From 4fe6a816707aace9e8e297b708411c5930537793 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 13 Mar 2014 13:46:29 -0700
+Subject: [PATCH 032958/122806] bcache: Add a real GC_MARK_RECLAIMABLE
+
+This means the garbage collection code can better check for data and metadata
+pointers to the same buckets.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/alloc.c   |  5 +++--
+ drivers/md/bcache/bcache.h  |  6 +++---
+ drivers/md/bcache/btree.c   | 18 ++++++++++++------
+ drivers/md/bcache/extents.c |  6 +++---
+ 4 files changed, 21 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/md/bcache/alloc.c b/drivers/md/bcache/alloc.c
+index a3e1427..5ba4eae 100644
+--- a/drivers/md/bcache/alloc.c
++++ b/drivers/md/bcache/alloc.c
+@@ -155,7 +155,8 @@ add:
+ 
+ static bool can_invalidate_bucket(struct cache *ca, struct bucket *b)
+ {
+-	return GC_MARK(b) == GC_MARK_RECLAIMABLE &&
++	return (!GC_MARK(b) ||
++		GC_MARK(b) == GC_MARK_RECLAIMABLE) &&
+ 		!atomic_read(&b->pin) &&
+ 		can_inc_bucket_gen(b);
+ }
+@@ -475,7 +476,7 @@ void bch_bucket_free(struct cache_set *c, struct bkey *k)
+ 	for (i = 0; i < KEY_PTRS(k); i++) {
+ 		struct bucket *b = PTR_BUCKET(c, k, i);
+ 
+-		SET_GC_MARK(b, GC_MARK_RECLAIMABLE);
++		SET_GC_MARK(b, 0);
+ 		SET_GC_SECTORS_USED(b, 0);
+ 		bch_bucket_add_unused(PTR_CACHE(c, k, i), b);
+ 	}
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 6d814f4..014236e 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -207,9 +207,9 @@ struct bucket {
+  */
+ 
+ BITMASK(GC_MARK,	 struct bucket, gc_mark, 0, 2);
+-#define GC_MARK_RECLAIMABLE	0
+-#define GC_MARK_DIRTY		1
+-#define GC_MARK_METADATA	2
++#define GC_MARK_RECLAIMABLE	1
++#define GC_MARK_DIRTY		2
++#define GC_MARK_METADATA	3
+ #define GC_SECTORS_USED_SIZE	13
+ #define MAX_GC_SECTORS_USED	(~(~0ULL << GC_SECTORS_USED_SIZE))
+ BITMASK(GC_SECTORS_USED, struct bucket, gc_mark, 2, GC_SECTORS_USED_SIZE);
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index ea5a59e..1672db3 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -1160,6 +1160,8 @@ static uint8_t __bch_btree_mark_key(struct cache_set *c, int level,
+ 			SET_GC_MARK(g, GC_MARK_METADATA);
+ 		else if (KEY_DIRTY(k))
+ 			SET_GC_MARK(g, GC_MARK_DIRTY);
++		else if (!GC_MARK(g))
++			SET_GC_MARK(g, GC_MARK_RECLAIMABLE);
+ 
+ 		/* guard against overflow */
+ 		SET_GC_SECTORS_USED(g, min_t(unsigned,
+@@ -1559,7 +1561,7 @@ static void btree_gc_start(struct cache_set *c)
+ 		for_each_bucket(b, ca) {
+ 			b->gc_gen = b->gen;
+ 			if (!atomic_read(&b->pin)) {
+-				SET_GC_MARK(b, GC_MARK_RECLAIMABLE);
++				SET_GC_MARK(b, 0);
+ 				SET_GC_SECTORS_USED(b, 0);
+ 			}
+ 		}
+@@ -1622,12 +1624,16 @@ size_t bch_btree_gc_finish(struct cache_set *c)
+ 			b->last_gc	= b->gc_gen;
+ 			c->need_gc	= max(c->need_gc, bucket_gc_gen(b));
+ 
+-			if (!atomic_read(&b->pin) &&
+-			    GC_MARK(b) == GC_MARK_RECLAIMABLE) {
++			if (atomic_read(&b->pin))
++				continue;
++
++			BUG_ON(!GC_MARK(b) && GC_SECTORS_USED(b));
++
++			if (!GC_MARK(b) || GC_MARK(b) == GC_MARK_RECLAIMABLE)
+ 				available++;
+-				if (!GC_SECTORS_USED(b))
+-					bch_bucket_add_unused(ca, b);
+-			}
++
++			if (!GC_MARK(b))
++				bch_bucket_add_unused(ca, b);
+ 		}
+ 	}
+ 
+diff --git a/drivers/md/bcache/extents.c b/drivers/md/bcache/extents.c
+index 416d1a3..82d5e32 100644
+--- a/drivers/md/bcache/extents.c
++++ b/drivers/md/bcache/extents.c
+@@ -499,9 +499,9 @@ static bool bch_extent_bad_expensive(struct btree *b, const struct bkey *k,
+ 
+ 	if (mutex_trylock(&b->c->bucket_lock)) {
+ 		if (b->c->gc_mark_valid &&
+-		    ((GC_MARK(g) != GC_MARK_DIRTY &&
+-		      KEY_DIRTY(k)) ||
+-		     GC_MARK(g) == GC_MARK_METADATA))
++		    (!GC_MARK(g) ||
++		     GC_MARK(g) == GC_MARK_METADATA ||
++		     (GC_MARK(g) != GC_MARK_DIRTY && KEY_DIRTY(k))))
+ 			goto err;
+ 
+ 		if (g->prio == BTREE_PRIO)
+-- 
+2.6.2
+

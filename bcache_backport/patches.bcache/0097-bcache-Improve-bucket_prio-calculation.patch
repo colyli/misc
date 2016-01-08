@@ -1,0 +1,60 @@
+From e0a985a4b1b533311ec88c85177c45d036313f75 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Tue, 12 Nov 2013 13:49:10 -0800
+Subject: [PATCH 019190/122806] bcache: Improve bucket_prio() calculation
+
+When deciding what order to reuse buckets we take into account both the bucket's
+priority (which indicates lru order) and also the amount of live data in that
+bucket. The way they were scaled together wasn't as correct as it could be...
+this patch improves and documents it.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/alloc.c  | 17 +++++++++++++++--
+ drivers/md/bcache/bcache.h |  2 +-
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/md/bcache/alloc.c b/drivers/md/bcache/alloc.c
+index bcfd96e..c0d37d0 100644
+--- a/drivers/md/bcache/alloc.c
++++ b/drivers/md/bcache/alloc.c
+@@ -168,8 +168,21 @@ static void invalidate_one_bucket(struct cache *ca, struct bucket *b)
+ 	fifo_push(&ca->free_inc, b - ca->buckets);
+ }
+ 
+-#define bucket_prio(b)				\
+-	(((unsigned) (b->prio - ca->set->min_prio)) * GC_SECTORS_USED(b))
++/*
++ * Determines what order we're going to reuse buckets, smallest bucket_prio()
++ * first: we also take into account the number of sectors of live data in that
++ * bucket, and in order for that multiply to make sense we have to scale bucket
++ *
++ * Thus, we scale the bucket priorities so that the bucket with the smallest
++ * prio is worth 1/8th of what INITIAL_PRIO is worth.
++ */
++
++#define bucket_prio(b)							\
++({									\
++	unsigned min_prio = (INITIAL_PRIO - ca->set->min_prio) / 8;	\
++									\
++	(b->prio - ca->set->min_prio + min_prio) * GC_SECTORS_USED(b);	\
++})
+ 
+ #define bucket_max_cmp(l, r)	(bucket_prio(l) < bucket_prio(r))
+ #define bucket_min_cmp(l, r)	(bucket_prio(l) > bucket_prio(r))
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 93b8484..0c707e4 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -704,7 +704,7 @@ struct bbio {
+ };
+ 
+ #define BTREE_PRIO		USHRT_MAX
+-#define INITIAL_PRIO		32768
++#define INITIAL_PRIO		32768U
+ 
+ #define btree_bytes(c)		((c)->btree_pages * PAGE_SIZE)
+ #define btree_blocks(b)							\
+-- 
+2.6.2
+

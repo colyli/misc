@@ -1,0 +1,114 @@
+From da415a096fc06e49d1a15f7a06bcfe6ad44c5d38 Mon Sep 17 00:00:00 2001
+From: Nicholas Swenson <nks@daterainc.com>
+Date: Thu, 9 Jan 2014 16:03:04 -0800
+Subject: [PATCH 032951/122806] bcache: Fix moving_gc deadlocking with a
+ foreground write
+
+Deadlock happened because a foreground write slept, waiting for a bucket
+to be allocated. Normally the gc would mark buckets available for invalidation.
+But the moving_gc was stuck waiting for outstanding writes to complete.
+These writes used the bcache_wq, the same queue foreground writes used.
+
+This fix gives moving_gc its own work queue, so it was still finish moving
+even if foreground writes are stuck waiting for allocation. It also makes
+work queue a parameter to the data_insert path, so moving_gc can use its
+workqueue for writes.
+
+Signed-off-by: Nicholas Swenson <nks@daterainc.com>
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h   |  2 ++
+ drivers/md/bcache/movinggc.c |  5 +++--
+ drivers/md/bcache/request.c  | 13 +++++++------
+ drivers/md/bcache/request.h  |  1 +
+ drivers/md/bcache/super.c    |  3 +++
+ 5 files changed, 16 insertions(+), 8 deletions(-)
+
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bcache.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+@@ -632,6 +632,8 @@ struct cache_set {
+ 	/* Number of moving GC bios in flight */
+ 	struct semaphore	moving_in_flight;
+ 
++	struct workqueue_struct	*moving_gc_wq;
++
+ 	struct btree		*root;
+ 
+ #ifdef CONFIG_BCACHE_DEBUG
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/movinggc.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/movinggc.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/movinggc.c
+@@ -115,7 +115,7 @@ static void write_moving(struct closure
+ 		closure_call(&op->cl, bch_data_insert, NULL, cl);
+ 	}
+ 
+-	continue_at(cl, write_moving_finish, system_wq);
++	continue_at(cl, write_moving_finish, op->wq);
+ }
+ 
+ static void read_moving_submit(struct closure *cl)
+@@ -125,7 +125,7 @@ static void read_moving_submit(struct cl
+ 
+ 	bch_submit_bbio(bio, io->op.c, &io->w->key, 0);
+ 
+-	continue_at(cl, write_moving, system_wq);
++	continue_at(cl, write_moving, io->op.wq);
+ }
+ 
+ static void read_moving(struct cache_set *c)
+@@ -160,6 +160,7 @@ static void read_moving(struct cache_set
+ 		io->w		= w;
+ 		io->op.inode	= KEY_INODE(&w->key);
+ 		io->op.c	= c;
++		io->op.wq	= c->moving_gc_wq;
+ 
+ 		moving_init(io);
+ 		bio = &io->bio.bio;
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/request.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+@@ -818,6 +818,7 @@ static struct search *search_alloc(struc
+ 	s->orig_bio		= bio;
+ 	s->write		= (bio->bi_rw & REQ_WRITE) != 0;
+ 	s->iop.flush_journal	= (bio->bi_rw & (REQ_FLUSH|REQ_FUA)) != 0;
++	s->iop.wq		= bcache_wq;
+ 	s->recoverable		= 1;
+ 	s->start_time		= jiffies;
+ 	do_bio_hook(s);
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/request.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/request.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/request.h
+@@ -7,6 +7,7 @@ struct data_insert_op {
+ 	struct closure		cl;
+ 	struct cache_set	*c;
+ 	struct bio		*bio;
++	struct workqueue_struct *wq;
+ 
+ 	unsigned		inode;
+ 	uint16_t		write_point;
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/super.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+@@ -1356,6 +1356,8 @@ static void cache_set_free(struct closur
+ 	bch_bset_sort_state_free(&c->sort);
+ 	free_pages((unsigned long) c->uuids, ilog2(bucket_pages(c)));
+ 
++	if (c->moving_gc_wq)
++		destroy_workqueue(c->moving_gc_wq);
+ 	if (c->bio_split)
+ 		bioset_free(c->bio_split);
+ 	if (c->fill_iter)
+@@ -1522,6 +1524,7 @@ struct cache_set *bch_cache_set_alloc(st
+ 	    !(c->fill_iter = mempool_create_kmalloc_pool(1, iter_size)) ||
+ 	    !(c->bio_split = bioset_create(4, offsetof(struct bbio, bio))) ||
+ 	    !(c->uuids = alloc_bucket_pages(GFP_KERNEL, c)) ||
++	    !(c->moving_gc_wq = create_workqueue("bcache_gc")) ||
+ 	    bch_journal_alloc(c) ||
+ 	    bch_btree_cache_alloc(c) ||
+ 	    bch_open_buckets_alloc(c) ||

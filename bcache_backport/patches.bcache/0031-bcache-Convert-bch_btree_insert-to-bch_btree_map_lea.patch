@@ -1,0 +1,205 @@
+From cc7b8819212f437fc82f0f9cdc24deb0fb5d775f Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 24 Jul 2013 18:07:22 -0700
+Subject: [PATCH 009461/122806] bcache: Convert bch_btree_insert() to
+ bch_btree_map_leaf_nodes()
+
+Last of the btree_map() conversions. Main visible effect is
+bch_btree_insert() is no longer taking a struct btree_op as an argument
+anymore - there's no fancy state machine stuff going on, it's just a
+normal function.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c     | 79 ++++++++++++++++++++-----------------------
+ drivers/md/bcache/btree.h     |  4 +--
+ drivers/md/bcache/journal.c   |  4 +--
+ drivers/md/bcache/request.c   |  2 +-
+ drivers/md/bcache/writeback.c |  6 ++--
+ 5 files changed, 43 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 441524d..f5aa4ad 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -2174,61 +2174,56 @@ out:
+ 	return ret;
+ }
+ 
+-static int bch_btree_insert_recurse(struct btree *b, struct btree_op *op,
+-				    struct keylist *keys, atomic_t *journal_ref,
+-				    struct bkey *replace_key)
+-{
+-	if (bch_keylist_empty(keys))
+-		return 0;
+-
+-	if (b->level) {
+-		struct bkey *k;
+-
+-		k = bch_next_recurse_key(b, &START_KEY(keys->keys));
+-		if (!k) {
+-			btree_bug(b, "no key to recurse on at level %i/%i",
+-				  b->level, b->c->root->level);
++struct btree_insert_op {
++	struct btree_op	op;
++	struct keylist	*keys;
++	atomic_t	*journal_ref;
++	struct bkey	*replace_key;
++};
+ 
+-			bch_keylist_reset(keys);
+-			return -EIO;
+-		}
++int btree_insert_fn(struct btree_op *b_op, struct btree *b)
++{
++	struct btree_insert_op *op = container_of(b_op,
++					struct btree_insert_op, op);
+ 
+-		return btree(insert_recurse, k, b, op, keys,
+-			     journal_ref, replace_key);
+-	} else {
+-		return bch_btree_insert_node(b, op, keys,
+-					     journal_ref, replace_key);
+-	}
++	int ret = bch_btree_insert_node(b, &op->op, op->keys,
++					op->journal_ref, op->replace_key);
++	if (ret && !bch_keylist_empty(op->keys))
++		return ret;
++	else
++		return MAP_DONE;
+ }
+ 
+-int bch_btree_insert(struct btree_op *op, struct cache_set *c,
+-		     struct keylist *keys, atomic_t *journal_ref,
+-		     struct bkey *replace_key)
++int bch_btree_insert(struct cache_set *c, struct keylist *keys,
++		     atomic_t *journal_ref, struct bkey *replace_key)
+ {
++	struct btree_insert_op op;
+ 	int ret = 0;
+ 
++	BUG_ON(current->bio_list);
+ 	BUG_ON(bch_keylist_empty(keys));
+ 
+-	while (!bch_keylist_empty(keys)) {
+-		op->lock = 0;
+-		ret = btree_root(insert_recurse, c, op, keys,
+-				 journal_ref, replace_key);
++	bch_btree_op_init(&op.op, 0);
++	op.keys		= keys;
++	op.journal_ref	= journal_ref;
++	op.replace_key	= replace_key;
+ 
+-		if (ret == -EAGAIN) {
+-			BUG();
+-			ret = 0;
+-		} else if (ret) {
+-			struct bkey *k;
++	while (!ret && !bch_keylist_empty(keys)) {
++		op.op.lock = 0;
++		ret = bch_btree_map_leaf_nodes(&op.op, c,
++					       &START_KEY(keys->keys),
++					       btree_insert_fn);
++	}
+ 
+-			pr_err("error %i", ret);
++	if (ret) {
++		struct bkey *k;
+ 
+-			while ((k = bch_keylist_pop(keys)))
+-				bkey_put(c, k, 0);
+-		}
+-	}
++		pr_err("error %i", ret);
+ 
+-	if (op->insert_collision)
+-		return -ESRCH;
++		while ((k = bch_keylist_pop(keys)))
++			bkey_put(c, k, 0);
++	} else if (op.op.insert_collision)
++		ret = -ESRCH;
+ 
+ 	return ret;
+ }
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 6ff08be..8fc1e89 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -281,8 +281,8 @@ struct btree *bch_btree_node_get(struct cache_set *, struct bkey *, int, bool);
+ 
+ int bch_btree_insert_check_key(struct btree *, struct btree_op *,
+ 			       struct bkey *);
+-int bch_btree_insert(struct btree_op *, struct cache_set *,
+-		     struct keylist *, atomic_t *, struct bkey *);
++int bch_btree_insert(struct cache_set *, struct keylist *,
++		     atomic_t *, struct bkey *);
+ 
+ int bch_gc_thread_start(struct cache_set *);
+ size_t bch_btree_gc_finish(struct cache_set *);
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 592adf5..86de64a 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -302,10 +302,8 @@ int bch_journal_replay(struct cache_set *s, struct list_head *list)
+ 
+ 	uint64_t start = i->j.last_seq, end = i->j.seq, n = start;
+ 	struct keylist keylist;
+-	struct btree_op op;
+ 
+ 	bch_keylist_init(&keylist);
+-	bch_btree_op_init(&op, SHRT_MAX);
+ 
+ 	list_for_each_entry(i, list, list) {
+ 		BUG_ON(i->pin && atomic_read(i->pin) != 1);
+@@ -322,7 +320,7 @@ int bch_journal_replay(struct cache_set *s, struct list_head *list)
+ 			bkey_copy(keylist.top, k);
+ 			bch_keylist_push(&keylist);
+ 
+-			ret = bch_btree_insert(&op, s, &keylist, i->pin, NULL);
++			ret = bch_btree_insert(s, &keylist, i->pin, NULL);
+ 			if (ret)
+ 				goto err;
+ 
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index bcce06a..6cee2ae 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -237,7 +237,7 @@ static void bch_data_insert_keys(struct closure *cl)
+ 					  s->flush_journal
+ 					  ? &s->cl : NULL);
+ 
+-	ret = bch_btree_insert(&s->op, s->c, &s->insert_keys,
++	ret = bch_btree_insert(s->c, &s->insert_keys,
+ 			       journal_ref, replace_key);
+ 	if (ret == -ESRCH) {
+ 		s->insert_collision = true;
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index 312032e..ab0f6b4 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -139,12 +139,10 @@ static void write_dirty_finish(struct closure *cl)
+ 
+ 	/* This is kind of a dumb way of signalling errors. */
+ 	if (KEY_DIRTY(&w->key)) {
++		int ret;
+ 		unsigned i;
+-		struct btree_op op;
+ 		struct keylist keys;
+-		int ret;
+ 
+-		bch_btree_op_init(&op, -1);
+ 		bch_keylist_init(&keys);
+ 
+ 		bkey_copy(keys.top, &w->key);
+@@ -154,7 +152,7 @@ static void write_dirty_finish(struct closure *cl)
+ 		for (i = 0; i < KEY_PTRS(&w->key); i++)
+ 			atomic_inc(&PTR_BUCKET(dc->disk.c, &w->key, i)->pin);
+ 
+-		ret = bch_btree_insert(&op, dc->disk.c, &keys, NULL, &w->key);
++		ret = bch_btree_insert(dc->disk.c, &keys, NULL, &w->key);
+ 
+ 		if (ret)
+ 			trace_bcache_writeback_collision(&w->key);
+-- 
+2.6.2
+

@@ -1,0 +1,103 @@
+From 0a45114534766058193eb2605c136562a4f7bcc8 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 18 Dec 2013 00:01:06 -0800
+Subject: [PATCH 019173/122806] bcache: Use a mempool for mergesort temporary
+ space
+
+It was a single element mempool before, it's slightly cleaner to just use a real
+mempool.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h |  7 +------
+ drivers/md/bcache/bset.c   | 12 +++++-------
+ drivers/md/bcache/super.c  |  5 ++---
+ 3 files changed, 8 insertions(+), 16 deletions(-)
+
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bcache.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+@@ -649,12 +649,7 @@ struct cache_set {
+ 	 */
+ 	mempool_t		*fill_iter;
+ 
+-	/*
+-	 * btree_sort() is a merge sort and requires temporary space - single
+-	 * element mempool
+-	 */
+-	struct mutex		sort_lock;
+-	struct bset		*sort;
++	mempool_t		*sort_pool;
+ 	unsigned		sort_crit_factor;
+ 
+ 	/* List of buckets we're currently writing data to */
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bset.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bset.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bset.c
+@@ -1047,11 +1047,12 @@ static void __btree_sort(struct btree *b
+ {
+ 	uint64_t start_time;
+ 	bool remove_stale = !b->written;
++	bool used_mempool = false;
+ 	struct bset *out = (void *) __get_free_pages(__GFP_NOWARN|GFP_NOIO,
+ 						     order);
+ 	if (!out) {
+-		mutex_lock(&b->c->sort_lock);
+-		out = b->c->sort;
++		out = page_address(mempool_alloc(b->c->sort_pool, GFP_NOIO));
++		used_mempool = true;
+ 		order = ilog2(bucket_pages(b->c));
+ 	}
+ 
+@@ -1071,17 +1072,14 @@ static void __btree_sort(struct btree *b
+ 		out->seq	= b->sets[0].data->seq;
+ 		out->version	= b->sets[0].data->version;
+ 		swap(out, b->sets[0].data);
+-
+-		if (b->c->sort == b->sets[0].data)
+-			b->c->sort = out;
+ 	} else {
+ 		b->sets[start].data->keys = out->keys;
+ 		memcpy(b->sets[start].data->start, out->start,
+ 		       (void *) end(out) - (void *) out->start);
+ 	}
+ 
+-	if (out == b->c->sort)
+-		mutex_unlock(&b->c->sort_lock);
++	if (used_mempool)
++		mempool_free(virt_to_page(out), b->c->sort_pool);
+ 	else
+ 		free_pages((unsigned long) out, order);
+ 
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/super.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+@@ -1352,7 +1352,6 @@ static void cache_set_free(struct closur
+ 		}
+ 
+ 	free_pages((unsigned long) c->uuids, ilog2(bucket_pages(c)));
+-	free_pages((unsigned long) c->sort, ilog2(bucket_pages(c)));
+ 
+ 	if (c->bio_split)
+ 		bioset_free(c->bio_split);
+@@ -1489,7 +1488,6 @@ struct cache_set *bch_cache_set_alloc(st
+ 	init_waitqueue_head(&c->try_wait);
+ 	init_waitqueue_head(&c->bucket_wait);
+ 	sema_init(&c->uuid_write_mutex, 1);
+-	mutex_init(&c->sort_lock);
+ 
+ 	spin_lock_init(&c->sort_time.lock);
+ 	spin_lock_init(&c->btree_gc_time.lock);
+@@ -1519,7 +1517,8 @@ struct cache_set *bch_cache_set_alloc(st
+ 				bucket_pages(c))) ||
+ 	    !(c->fill_iter = mempool_create_kmalloc_pool(1, iter_size)) ||
+ 	    !(c->bio_split = bioset_create(4, offsetof(struct bbio, bio))) ||
+-	    !(c->sort = alloc_bucket_pages(GFP_KERNEL, c)) ||
++	    !(c->sort_pool = mempool_create_page_pool(1,
++				ilog2(bucket_pages(c)))) ||
+ 	    !(c->uuids = alloc_bucket_pages(GFP_KERNEL, c)) ||
+ 	    bch_journal_alloc(c) ||
+ 	    bch_btree_cache_alloc(c) ||

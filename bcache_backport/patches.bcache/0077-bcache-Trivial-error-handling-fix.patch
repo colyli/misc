@@ -1,0 +1,27 @@
+From 5c41c8a713da7874bd79196696a275beeb11821e Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 8 Jul 2013 17:53:26 -0700
+Subject: [PATCH 019170/122806] bcache: Trivial error handling fix
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/super.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index e363efc..677a604 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -2065,7 +2065,8 @@ static void bcache_exit(void)
+ 		kobject_put(bcache_kobj);
+ 	if (bcache_wq)
+ 		destroy_workqueue(bcache_wq);
+-	unregister_blkdev(bcache_major, "bcache");
++	if (bcache_major)
++		unregister_blkdev(bcache_major, "bcache");
+ 	unregister_reboot_notifier(&reboot);
+ }
+ 
+-- 
+2.6.2
+

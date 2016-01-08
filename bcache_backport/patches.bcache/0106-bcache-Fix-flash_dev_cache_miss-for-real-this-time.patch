@@ -1,0 +1,46 @@
+From 1b4eaf3d3809a658c85911e92d9ff64086931efa Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 16 Jan 2014 15:04:18 -0800
+Subject: [PATCH 028039/122806] bcache: Fix flash_dev_cache_miss() for real
+ this time
+
+The code was using sectors to count the number of sectors it was zeroing... but
+then it passed it to bio_advance()... after it had been set to 0. Amusing...
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/request.c | 19 +++++--------------
+ 1 file changed, 5 insertions(+), 14 deletions(-)
+
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/request.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+@@ -1204,22 +1204,13 @@ void bch_cached_dev_request_init(struct
+ static int flash_dev_cache_miss(struct btree *b, struct search *s,
+ 				struct bio *bio, unsigned sectors)
+ {
+-	struct bio_vec *bv;
+-	int i;
++	unsigned bytes = min(sectors, bio_sectors(bio)) << 9;
+ 
+-	/* Zero fill bio */
++	swap(bio->bi_size, bytes);
++	zero_fill_bio(bio);
++	swap(bio->bi_size, bytes);
+ 
+-	bio_for_each_segment(bv, bio, i) {
+-		unsigned j = min(bv->bv_len >> 9, sectors);
+-
+-		void *p = kmap(bv->bv_page);
+-		memset(p + bv->bv_offset, 0, j << 9);
+-		kunmap(bv->bv_page);
+-
+-		sectors	-= j;
+-	}
+-
+-	bio_advance(bio, min(sectors << 9, bio->bi_size));
++	bio_advance(bio, bytes);
+ 
+ 	if (!bio->bi_size)
+ 		return MAP_DONE;

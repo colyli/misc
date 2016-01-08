@@ -1,0 +1,82 @@
+From 3572324af0f4ef877545e5a17bd3e788551f166a Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Fri, 10 Jan 2014 18:53:02 -0800
+Subject: [PATCH 022876/122806] bcache: Minor fixes from kbuild robot
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c    | 7 +++++--
+ drivers/md/bcache/btree.c   | 2 +-
+ drivers/md/bcache/extents.c | 2 +-
+ drivers/md/bcache/sysfs.c   | 2 +-
+ 4 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index 4f6b594..3f74b4b 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -23,7 +23,7 @@ void bch_dump_bset(struct btree_keys *b, struct bset *i, unsigned set)
+ 	for (k = i->start; k < bset_bkey_last(i); k = next) {
+ 		next = bkey_next(k);
+ 
+-		printk(KERN_ERR "block %u key %zi/%u: ", set,
++		printk(KERN_ERR "block %u key %li/%u: ", set,
+ 		       (uint64_t *) k - i->d, i->keys);
+ 
+ 		if (b->ops->key_dump)
+@@ -1185,9 +1185,12 @@ static void __btree_sort(struct btree_keys *b, struct btree_iter *iter,
+ 	struct bset *out = (void *) __get_free_pages(__GFP_NOWARN|GFP_NOIO,
+ 						     order);
+ 	if (!out) {
++		struct page *outp;
++
+ 		BUG_ON(order > state->page_order);
+ 
+-		out = page_address(mempool_alloc(state->pool, GFP_NOIO));
++		outp = mempool_alloc(state->pool, GFP_NOIO);
++		out = page_address(outp);
+ 		used_mempool = true;
+ 		order = state->page_order;
+ 	}
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 7d42118..5f9c2a6 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -1805,7 +1805,7 @@ static bool btree_insert_key(struct btree *b, struct bkey *k,
+ 
+ static size_t insert_u64s_remaining(struct btree *b)
+ {
+-	ssize_t ret = bch_btree_keys_u64s_remaining(&b->keys);
++	long ret = bch_btree_keys_u64s_remaining(&b->keys);
+ 
+ 	/*
+ 	 * Might land in the middle of an existing extent and have to split it
+diff --git a/drivers/md/bcache/extents.c b/drivers/md/bcache/extents.c
+index c3ead58..416d1a3 100644
+--- a/drivers/md/bcache/extents.c
++++ b/drivers/md/bcache/extents.c
+@@ -194,7 +194,7 @@ err:
+ 	mutex_unlock(&b->c->bucket_lock);
+ 	bch_extent_to_text(buf, sizeof(buf), k);
+ 	btree_bug(b,
+-"inconsistent btree pointer %s: bucket %li pin %i prio %i gen %i last_gc %i mark %llu gc_gen %i",
++"inconsistent btree pointer %s: bucket %zi pin %i prio %i gen %i last_gc %i mark %llu gc_gen %i",
+ 		  buf, PTR_BUCKET_NR(b->c, k, i), atomic_read(&g->pin),
+ 		  g->prio, g->gen, g->last_gc, GC_MARK(g), g->gc_gen);
+ 	return true;
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index c6ab693..d8458d4 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -416,7 +416,7 @@ static int btree_bset_stats(struct btree_op *b_op, struct btree *b)
+ 	return MAP_CONTINUE;
+ }
+ 
+-int bch_bset_print_stats(struct cache_set *c, char *buf)
++static int bch_bset_print_stats(struct cache_set *c, char *buf)
+ {
+ 	struct bset_stats_op op;
+ 	int ret;
+-- 
+2.6.2
+

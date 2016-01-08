@@ -1,0 +1,169 @@
+From f67342dd342d5917d94a7c0ffbde5f78e0d7a57a Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 11 Nov 2013 19:25:55 -0800
+Subject: [PATCH 019183/122806] bcache: Refactor bset_tree sysfs stats
+
+We're in the process of turning bset.c into library code, so none of the code in
+that file should know about struct cache_set or struct btree - so, move the
+btree traversal part of the stats code to sysfs.c.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c  | 49 ++++-------------------------------------------
+ drivers/md/bcache/bset.h  | 10 ++++++++--
+ drivers/md/bcache/sysfs.c | 42 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 54 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index f34ef56..a3ffc37 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -1122,29 +1122,16 @@ out:
+ }
+ EXPORT_SYMBOL(bch_btree_sort_lazy);
+ 
+-/* Sysfs stuff */
+-
+-struct bset_stats {
+-	struct btree_op op;
+-	size_t nodes;
+-	size_t sets_written, sets_unwritten;
+-	size_t bytes_written, bytes_unwritten;
+-	size_t floats, failed;
+-};
+-
+-static int btree_bset_stats(struct btree_op *op, struct btree *b)
++void bch_btree_keys_stats(struct btree_keys *b, struct bset_stats *stats)
+ {
+-	struct bset_stats *stats = container_of(op, struct bset_stats, op);
+ 	unsigned i;
+ 
+-	stats->nodes++;
+-
+-	for (i = 0; i <= b->keys.nsets; i++) {
+-		struct bset_tree *t = &b->keys.set[i];
++	for (i = 0; i <= b->nsets; i++) {
++		struct bset_tree *t = &b->set[i];
+ 		size_t bytes = t->data->keys * sizeof(uint64_t);
+ 		size_t j;
+ 
+-		if (bset_written(&b->keys, t)) {
++		if (bset_written(b, t)) {
+ 			stats->sets_written++;
+ 			stats->bytes_written += bytes;
+ 
+@@ -1158,32 +1145,4 @@ static int btree_bset_stats(struct btree_op *op, struct btree *b)
+ 			stats->bytes_unwritten += bytes;
+ 		}
+ 	}
+-
+-	return MAP_CONTINUE;
+-}
+-
+-int bch_bset_print_stats(struct cache_set *c, char *buf)
+-{
+-	struct bset_stats t;
+-	int ret;
+-
+-	memset(&t, 0, sizeof(struct bset_stats));
+-	bch_btree_op_init(&t.op, -1);
+-
+-	ret = bch_btree_map_nodes(&t.op, c, &ZERO_KEY, btree_bset_stats);
+-	if (ret < 0)
+-		return ret;
+-
+-	return snprintf(buf, PAGE_SIZE,
+-			"btree nodes:		%zu\n"
+-			"written sets:		%zu\n"
+-			"unwritten sets:		%zu\n"
+-			"written key bytes:	%zu\n"
+-			"unwritten key bytes:	%zu\n"
+-			"floats:			%zu\n"
+-			"failed:			%zu\n",
+-			t.nodes,
+-			t.sets_written, t.sets_unwritten,
+-			t.bytes_written, t.bytes_unwritten,
+-			t.floats, t.failed);
+ }
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index 4fc40fd..4913569 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -365,6 +365,14 @@ static inline void bch_btree_sort(struct btree *b,
+ 	bch_btree_sort_partial(b, 0, state);
+ }
+ 
++struct bset_stats {
++	size_t sets_written, sets_unwritten;
++	size_t bytes_written, bytes_unwritten;
++	size_t floats, failed;
++};
++
++void bch_btree_keys_stats(struct btree_keys *, struct bset_stats *);
++
+ /* Bkey utility code */
+ 
+ #define bset_bkey_last(i)	bkey_idx((struct bkey *) (i)->d, (i)->keys)
+@@ -495,6 +503,4 @@ int __bch_keylist_realloc(struct keylist *, unsigned);
+ struct cache_set;
+ const char *bch_ptr_status(struct cache_set *, const struct bkey *);
+ 
+-int bch_bset_print_stats(struct cache_set *, char *);
+-
+ #endif
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index 7e175db..db2111b 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -400,6 +400,48 @@ static struct attribute *bch_flash_dev_files[] = {
+ };
+ KTYPE(bch_flash_dev);
+ 
++struct bset_stats_op {
++	struct btree_op op;
++	size_t nodes;
++	struct bset_stats stats;
++};
++
++static int btree_bset_stats(struct btree_op *b_op, struct btree *b)
++{
++	struct bset_stats_op *op = container_of(b_op, struct bset_stats_op, op);
++
++	op->nodes++;
++	bch_btree_keys_stats(&b->keys, &op->stats);
++
++	return MAP_CONTINUE;
++}
++
++int bch_bset_print_stats(struct cache_set *c, char *buf)
++{
++	struct bset_stats_op op;
++	int ret;
++
++	memset(&op, 0, sizeof(op));
++	bch_btree_op_init(&op.op, -1);
++
++	ret = bch_btree_map_nodes(&op.op, c, &ZERO_KEY, btree_bset_stats);
++	if (ret < 0)
++		return ret;
++
++	return snprintf(buf, PAGE_SIZE,
++			"btree nodes:		%zu\n"
++			"written sets:		%zu\n"
++			"unwritten sets:		%zu\n"
++			"written key bytes:	%zu\n"
++			"unwritten key bytes:	%zu\n"
++			"floats:			%zu\n"
++			"failed:			%zu\n",
++			op.nodes,
++			op.stats.sets_written, op.stats.sets_unwritten,
++			op.stats.bytes_written, op.stats.bytes_unwritten,
++			op.stats.floats, op.stats.failed);
++}
++
+ SHOW(__bch_cache_set)
+ {
+ 	unsigned root_usage(struct cache_set *c)
+-- 
+2.6.2
+

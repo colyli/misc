@@ -1,0 +1,141 @@
+From 65d22e911bfc4f46cda4751f1b1926b43c316c14 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 31 Jul 2013 00:03:54 -0700
+Subject: [PATCH 009476/122806] bcache: Move spinlock into struct time_stats
+
+Minor cleanup.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h |  2 --
+ drivers/md/bcache/bset.c   |  7 +------
+ drivers/md/bcache/btree.c  |  3 ---
+ drivers/md/bcache/super.c  |  8 ++++++--
+ drivers/md/bcache/util.c   | 12 +++++++++---
+ drivers/md/bcache/util.h   |  1 +
+ 6 files changed, 17 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 3227355..816d079 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -666,11 +666,9 @@ struct cache_set {
+ 	unsigned		congested_read_threshold_us;
+ 	unsigned		congested_write_threshold_us;
+ 
+-	spinlock_t		sort_time_lock;
+ 	struct time_stats	sort_time;
+ 	struct time_stats	btree_gc_time;
+ 	struct time_stats	btree_split_time;
+-	spinlock_t		btree_read_time_lock;
+ 	struct time_stats	btree_read_time;
+ 	struct time_stats	try_harder_time;
+ 
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index b0fe0dc..1457339 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -1077,11 +1077,8 @@ static void __btree_sort(struct btree *b, struct btree_iter *iter,
+ 	if (b->written)
+ 		bset_build_written_tree(b);
+ 
+-	if (!start) {
+-		spin_lock(&b->c->sort_time_lock);
++	if (!start)
+ 		bch_time_stats_update(&b->c->sort_time, start_time);
+-		spin_unlock(&b->c->sort_time_lock);
+-	}
+ }
+ 
+ void bch_btree_sort_partial(struct btree *b, unsigned start)
+@@ -1128,9 +1125,7 @@ void bch_btree_sort_into(struct btree *b, struct btree *new)
+ 
+ 	btree_mergesort(b, new->sets->data, &iter, false, true);
+ 
+-	spin_lock(&b->c->sort_time_lock);
+ 	bch_time_stats_update(&b->c->sort_time, start_time);
+-	spin_unlock(&b->c->sort_time_lock);
+ 
+ 	bkey_copy_key(&new->key, &b->key);
+ 	new->sets->size = 0;
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index adc5bb0..1a7530c 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -317,10 +317,7 @@ void bch_btree_node_read(struct btree *b)
+ 		goto err;
+ 
+ 	bch_btree_node_read_done(b);
+-
+-	spin_lock(&b->c->btree_read_time_lock);
+ 	bch_time_stats_update(&b->c->btree_read_time, start_time);
+-	spin_unlock(&b->c->btree_read_time_lock);
+ 
+ 	return;
+ err:
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 041dd9d..4813ef6 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1435,9 +1435,13 @@ struct cache_set *bch_cache_set_alloc(struct cache_sb *sb)
+ 	init_waitqueue_head(&c->try_wait);
+ 	init_waitqueue_head(&c->bucket_wait);
+ 	closure_init_unlocked(&c->uuid_write);
+-	spin_lock_init(&c->sort_time_lock);
+ 	mutex_init(&c->sort_lock);
+-	spin_lock_init(&c->btree_read_time_lock);
++
++	spin_lock_init(&c->sort_time.lock);
++	spin_lock_init(&c->btree_gc_time.lock);
++	spin_lock_init(&c->btree_split_time.lock);
++	spin_lock_init(&c->btree_read_time.lock);
++	spin_lock_init(&c->try_harder_time.lock);
+ 
+ 	bch_moving_init_cache_set(c);
+ 
+diff --git a/drivers/md/bcache/util.c b/drivers/md/bcache/util.c
+index 420dad5..462214e 100644
+--- a/drivers/md/bcache/util.c
++++ b/drivers/md/bcache/util.c
+@@ -168,10 +168,14 @@ int bch_parse_uuid(const char *s, char *uuid)
+ 
+ void bch_time_stats_update(struct time_stats *stats, uint64_t start_time)
+ {
+-	uint64_t now		= local_clock();
+-	uint64_t duration	= time_after64(now, start_time)
++	uint64_t now, duration, last;
++
++	spin_lock(&stats->lock);
++
++	now		= local_clock();
++	duration	= time_after64(now, start_time)
+ 		? now - start_time : 0;
+-	uint64_t last		= time_after64(now, stats->last)
++	last		= time_after64(now, stats->last)
+ 		? now - stats->last : 0;
+ 
+ 	stats->max_duration = max(stats->max_duration, duration);
+@@ -188,6 +192,8 @@ void bch_time_stats_update(struct time_stats *stats, uint64_t start_time)
+ 	}
+ 
+ 	stats->last = now ?: 1;
++
++	spin_unlock(&stats->lock);
+ }
+ 
+ /**
+diff --git a/drivers/md/bcache/util.h b/drivers/md/bcache/util.h
+index 8ce5aab..362c4b3 100644
+--- a/drivers/md/bcache/util.h
++++ b/drivers/md/bcache/util.h
+@@ -378,6 +378,7 @@ ssize_t bch_snprint_string_list(char *buf, size_t size, const char * const list[
+ ssize_t bch_read_string_list(const char *buf, const char * const list[]);
+ 
+ struct time_stats {
++	spinlock_t	lock;
+ 	/*
+ 	 * all fields are in nanoseconds, averages are ewmas stored left shifted
+ 	 * by 8
+-- 
+2.6.2
+

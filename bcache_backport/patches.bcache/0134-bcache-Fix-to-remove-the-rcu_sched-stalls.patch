@@ -1,0 +1,31 @@
+From dbd810ab678d262d3772d29b65844d7b20dc47bc Mon Sep 17 00:00:00 2001
+From: Surbhi Palande <sap@daterainc.com>
+Date: Thu, 10 Apr 2014 16:09:51 -0700
+Subject: [PATCH 060622/122806] bcache: Fix to remove the rcu_sched stalls.
+
+while loop was executing infinitely.
+This fix ends the while loop gracefully.
+
+Signed-off-by: Surbhi Palande <sap@daterainc.com>
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/journal.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 363b881..ead001c 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -194,7 +194,8 @@ int bch_journal_read(struct cache_set *c, struct list_head *list)
+ 			continue;
+ bsearch:
+ 		/* Binary search */
+-		m = r = find_next_bit(bitmap, ca->sb.njournal_buckets, l + 1);
++		m = l;
++		r = find_next_bit(bitmap, ca->sb.njournal_buckets, l + 1);
+ 		pr_debug("starting binary search, l %u r %u", l, r);
+ 
+ 		while (l + 1 < r) {
+-- 
+2.6.2
+

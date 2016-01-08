@@ -1,0 +1,172 @@
+From 2d679fc75678551485df62274edaed452becd16d Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Sat, 17 Aug 2013 02:13:15 -0700
+Subject: [PATCH 009436/122806] bcache: Stripe size isn't necessarily a power
+ of two
+
+Originally I got this right... except that the divides didn't use
+do_div(), which broke 32 bit kernels. When I went to fix that, I forgot
+that the raid stripe size usually isn't a power of two... doh
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h    |  2 +-
+ drivers/md/bcache/super.c     |  7 +++----
+ drivers/md/bcache/sysfs.c     |  2 +-
+ drivers/md/bcache/writeback.c | 33 +++++++++++++++++----------------
+ drivers/md/bcache/writeback.h |  8 +++++---
+ 5 files changed, 27 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 5786156..6e836f2 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -437,7 +437,7 @@ struct bcache_device {
+ 	int			flush_done;
+ 
+ 	uint64_t		nr_stripes;
+-	unsigned		stripe_size_bits;
++	unsigned		stripe_size;
+ 	atomic_t		*stripe_sectors_dirty;
+ 
+ 	unsigned long		sectors_dirty_last;
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 74f2e90..d3169c0 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -761,11 +761,10 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
+ 	struct request_queue *q;
+ 	size_t n;
+ 
+-	if (!d->stripe_size_bits)
+-		d->stripe_size_bits = 31;
++	if (!d->stripe_size)
++		d->stripe_size = 1 << 31;
+ 
+-	d->nr_stripes = round_up(sectors, 1 << d->stripe_size_bits) >>
+-		d->stripe_size_bits;
++	d->nr_stripes = DIV_ROUND_UP_ULL(sectors, d->stripe_size);
+ 
+ 	if (!d->nr_stripes || d->nr_stripes > SIZE_MAX / sizeof(atomic_t))
+ 		return -ENOMEM;
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index 4211d82..b3a66f1 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -157,7 +157,7 @@ SHOW(__bch_cached_dev)
+ 	sysfs_hprint(dirty_data,
+ 		     bcache_dev_sectors_dirty(&dc->disk) << 9);
+ 
+-	sysfs_hprint(stripe_size,	(1 << dc->disk.stripe_size_bits) << 9);
++	sysfs_hprint(stripe_size,	dc->disk.stripe_size << 9);
+ 	var_printf(partial_stripes_expensive,	"%u");
+ 
+ 	var_printf(sequential_merge,	"%i");
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index ba3ee48..b842fbf 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -114,25 +114,25 @@ static bool dirty_pred(struct keybuf *buf, struct bkey *k)
+ 
+ static bool dirty_full_stripe_pred(struct keybuf *buf, struct bkey *k)
+ {
+-	uint64_t stripe;
++	uint64_t stripe = KEY_START(k);
+ 	unsigned nr_sectors = KEY_SIZE(k);
+ 	struct cached_dev *dc = container_of(buf, struct cached_dev,
+ 					     writeback_keys);
+-	unsigned stripe_size = 1 << dc->disk.stripe_size_bits;
+ 
+ 	if (!KEY_DIRTY(k))
+ 		return false;
+ 
+-	stripe = KEY_START(k) >> dc->disk.stripe_size_bits;
+-	while (1) {
+-		if (atomic_read(dc->disk.stripe_sectors_dirty + stripe) !=
+-		    stripe_size)
+-			return false;
++	do_div(stripe, dc->disk.stripe_size);
+ 
+-		if (nr_sectors <= stripe_size)
++	while (1) {
++		if (atomic_read(dc->disk.stripe_sectors_dirty + stripe) ==
++		    dc->disk.stripe_size)
+ 			return true;
+ 
+-		nr_sectors -= stripe_size;
++		if (nr_sectors <= dc->disk.stripe_size)
++			return false;
++
++		nr_sectors -= dc->disk.stripe_size;
+ 		stripe++;
+ 	}
+ }
+@@ -186,11 +186,12 @@ static void refill_dirty(struct closure *cl)
+ 
+ 		for (i = 0; i < dc->disk.nr_stripes; i++)
+ 			if (atomic_read(dc->disk.stripe_sectors_dirty + i) ==
+-			    1 << dc->disk.stripe_size_bits)
++			    dc->disk.stripe_size)
+ 				goto full_stripes;
+ 
+ 		goto normal_refill;
+ full_stripes:
++		searched_from_start = false;	/* not searching entire btree */
+ 		bch_refill_keybuf(dc->disk.c, buf, &end,
+ 				  dirty_full_stripe_pred);
+ 	} else {
+@@ -252,19 +253,19 @@ void bcache_dev_sectors_dirty_add(struct cache_set *c, unsigned inode,
+ 				  uint64_t offset, int nr_sectors)
+ {
+ 	struct bcache_device *d = c->devices[inode];
+-	unsigned stripe_size, stripe_offset;
+-	uint64_t stripe;
++	unsigned stripe_offset;
++	uint64_t stripe = offset;
+ 
+ 	if (!d)
+ 		return;
+ 
+-	stripe_size = 1 << d->stripe_size_bits;
+-	stripe = offset >> d->stripe_size_bits;
+-	stripe_offset = offset & (stripe_size - 1);
++	do_div(stripe, d->stripe_size);
++
++	stripe_offset = offset & (d->stripe_size - 1);
+ 
+ 	while (nr_sectors) {
+ 		int s = min_t(unsigned, abs(nr_sectors),
+-			      stripe_size - stripe_offset);
++			      d->stripe_size - stripe_offset);
+ 
+ 		if (nr_sectors < 0)
+ 			s = -s;
+diff --git a/drivers/md/bcache/writeback.h b/drivers/md/bcache/writeback.h
+index c91f61b..3496188 100644
+--- a/drivers/md/bcache/writeback.h
++++ b/drivers/md/bcache/writeback.h
+@@ -18,16 +18,18 @@ static inline bool bcache_dev_stripe_dirty(struct bcache_device *d,
+ 					   uint64_t offset,
+ 					   unsigned nr_sectors)
+ {
+-	uint64_t stripe = offset >> d->stripe_size_bits;
++	uint64_t stripe = offset;
++
++	do_div(stripe, d->stripe_size);
+ 
+ 	while (1) {
+ 		if (atomic_read(d->stripe_sectors_dirty + stripe))
+ 			return true;
+ 
+-		if (nr_sectors <= 1 << d->stripe_size_bits)
++		if (nr_sectors <= d->stripe_size)
+ 			return false;
+ 
+-		nr_sectors -= 1 << d->stripe_size_bits;
++		nr_sectors -= d->stripe_size;
+ 		stripe++;
+ 	}
+ }
+-- 
+2.6.2
+

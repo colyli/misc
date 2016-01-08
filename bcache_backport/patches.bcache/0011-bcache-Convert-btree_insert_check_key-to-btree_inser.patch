@@ -1,0 +1,265 @@
+From e7c590eb63509c5d5f48a390d23aa25f4417ac96 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Tue, 10 Sep 2013 18:39:16 -0700
+Subject: [PATCH 009441/122806] bcache: Convert btree_insert_check_key() to
+ btree_insert_node()
+
+This was the main point of all this refactoring - now,
+btree_insert_check_key() won't fail just because the leaf node happened
+to be full.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h  |  8 -----
+ drivers/md/bcache/btree.c   | 82 ++++++++++++++++++++++++++-------------------
+ drivers/md/bcache/btree.h   |  6 ++--
+ drivers/md/bcache/request.c | 55 +++++++++++++++---------------
+ 4 files changed, 79 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 6e836f2..10ce0c8 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -1091,14 +1091,6 @@ do {									\
+ 	for (b = (ca)->buckets + (ca)->sb.first_bucket;			\
+ 	     b < (ca)->buckets + (ca)->sb.nbuckets; b++)
+ 
+-static inline void __bkey_put(struct cache_set *c, struct bkey *k)
+-{
+-	unsigned i;
+-
+-	for (i = 0; i < KEY_PTRS(k); i++)
+-		atomic_dec_bug(&PTR_BUCKET(c, k, i)->pin);
+-}
+-
+ static inline void cached_dev_put(struct cached_dev *dc)
+ {
+ 	if (atomic_dec_and_test(&dc->count))
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 60d0646..08a8532 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -118,6 +118,15 @@ void bch_btree_op_init_stack(struct btree_op *op)
+ 
+ /* Btree key manipulation */
+ 
++void __bkey_put(struct cache_set *c, struct bkey *k)
++{
++	unsigned i;
++
++	for (i = 0; i < KEY_PTRS(k); i++)
++		if (ptr_available(c, k, i))
++			atomic_dec_bug(&PTR_BUCKET(c, k, i)->pin);
++}
++
+ static void bkey_put(struct cache_set *c, struct bkey *k, int level)
+ {
+ 	if ((level && KEY_OFFSET(k)) || !level)
+@@ -1855,8 +1864,6 @@ static bool bch_btree_insert_keys(struct btree *b, struct btree_op *op,
+ 	bool ret = false;
+ 	unsigned oldsize = bch_count_data(b);
+ 
+-	BUG_ON(!insert_lock(op, b));
+-
+ 	while (!bch_keylist_empty(insert_keys)) {
+ 		struct bset *i = write_block(b);
+ 		struct bkey *k = insert_keys->bottom;
+@@ -1898,39 +1905,6 @@ static bool bch_btree_insert_keys(struct btree *b, struct btree_op *op,
+ 	return ret;
+ }
+ 
+-bool bch_btree_insert_check_key(struct btree *b, struct btree_op *op,
+-				   struct bio *bio)
+-{
+-	bool ret = false;
+-	uint64_t btree_ptr = b->key.ptr[0];
+-	unsigned long seq = b->seq;
+-	BKEY_PADDED(k) tmp;
+-
+-	rw_unlock(false, b);
+-	rw_lock(true, b, b->level);
+-
+-	if (b->key.ptr[0] != btree_ptr ||
+-	    b->seq != seq + 1 ||
+-	    should_split(b))
+-		goto out;
+-
+-	op->replace = KEY(op->inode, bio_end_sector(bio), bio_sectors(bio));
+-
+-	SET_KEY_PTRS(&op->replace, 1);
+-	get_random_bytes(&op->replace.ptr[0], sizeof(uint64_t));
+-
+-	SET_PTR_DEV(&op->replace, 0, PTR_CHECK_DEV);
+-
+-	bkey_copy(&tmp.k, &op->replace);
+-
+-	BUG_ON(op->type != BTREE_INSERT);
+-	BUG_ON(!btree_insert_key(b, op, &tmp.k));
+-	ret = true;
+-out:
+-	downgrade_write(&b->lock);
+-	return ret;
+-}
+-
+ static int btree_split(struct btree *b, struct btree_op *op,
+ 		       struct keylist *insert_keys,
+ 		       struct keylist *parent_keys)
+@@ -2097,6 +2071,44 @@ static int bch_btree_insert_node(struct btree *b, struct btree_op *op,
+ 	return ret;
+ }
+ 
++int bch_btree_insert_check_key(struct btree *b, struct btree_op *op,
++			       struct bkey *check_key)
++{
++	int ret = -EINTR;
++	uint64_t btree_ptr = b->key.ptr[0];
++	unsigned long seq = b->seq;
++	struct keylist insert;
++	bool upgrade = op->lock == -1;
++
++	bch_keylist_init(&insert);
++
++	if (upgrade) {
++		rw_unlock(false, b);
++		rw_lock(true, b, b->level);
++
++		if (b->key.ptr[0] != btree_ptr ||
++		    b->seq != seq + 1)
++			goto out;
++	}
++
++	SET_KEY_PTRS(check_key, 1);
++	get_random_bytes(&check_key->ptr[0], sizeof(uint64_t));
++
++	SET_PTR_DEV(check_key, 0, PTR_CHECK_DEV);
++
++	bch_keylist_add(&insert, check_key);
++
++	BUG_ON(op->type != BTREE_INSERT);
++
++	ret = bch_btree_insert_node(b, op, &insert);
++
++	BUG_ON(!ret && !bch_keylist_empty(&insert));
++out:
++	if (upgrade)
++		downgrade_write(&b->lock);
++	return ret;
++}
++
+ static int bch_btree_insert_recurse(struct btree *b, struct btree_op *op)
+ {
+ 	if (bch_keylist_empty(&op->keys))
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 6d2fb75..73bd621 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -216,6 +216,8 @@ static inline struct bkey *bch_btree_iter_init(struct btree *b,
+ 	return __bch_btree_iter_init(b, iter, search, b->sets);
+ }
+ 
++void __bkey_put(struct cache_set *c, struct bkey *k);
++
+ /* Looping macros */
+ 
+ #define for_each_cached_btree(b, c, iter)				\
+@@ -380,8 +382,8 @@ struct btree *bch_btree_node_alloc(struct cache_set *, int, struct closure *);
+ struct btree *bch_btree_node_get(struct cache_set *, struct bkey *,
+ 				int, struct btree_op *);
+ 
+-bool bch_btree_insert_check_key(struct btree *, struct btree_op *,
+-				   struct bio *);
++int bch_btree_insert_check_key(struct btree *, struct btree_op *,
++			       struct bkey *);
+ int bch_btree_insert(struct btree_op *, struct cache_set *);
+ 
+ int bch_btree_search_recurse(struct btree *, struct btree_op *);
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 2a7f0dd..9ed334c 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -869,35 +869,39 @@ static int cached_dev_cache_miss(struct btree *b, struct search *s,
+ 				 struct bio *bio, unsigned sectors)
+ {
+ 	int ret = 0;
+-	unsigned reada;
++	unsigned reada = 0;
+ 	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
+ 	struct bio *miss;
+ 
+-	miss = bch_bio_split(bio, sectors, GFP_NOIO, s->d->bio_split);
+-	if (miss == bio)
+-		s->op.lookup_done = true;
++	if (s->cache_miss || s->op.skip) {
++		miss = bch_bio_split(bio, sectors, GFP_NOIO, s->d->bio_split);
++		if (miss == bio)
++			s->op.lookup_done = true;
++		goto out_submit;
++	}
+ 
+-	miss->bi_end_io		= request_endio;
+-	miss->bi_private	= &s->cl;
++	if (!(bio->bi_rw & REQ_RAHEAD) &&
++	    !(bio->bi_rw & REQ_META) &&
++	    s->op.c->gc_stats.in_use < CUTOFF_CACHE_READA)
++		reada = min_t(sector_t, dc->readahead >> 9,
++			      bdev_sectors(bio->bi_bdev) - bio_end_sector(bio));
+ 
+-	if (s->cache_miss || s->op.skip)
+-		goto out_submit;
++	s->cache_bio_sectors = min(sectors, bio_sectors(bio) + reada);
+ 
+-	if (miss != bio ||
+-	    (bio->bi_rw & REQ_RAHEAD) ||
+-	    (bio->bi_rw & REQ_META) ||
+-	    s->op.c->gc_stats.in_use >= CUTOFF_CACHE_READA)
+-		reada = 0;
+-	else {
+-		reada = min(dc->readahead >> 9,
+-			    sectors - bio_sectors(miss));
+-
+-		if (bio_end_sector(miss) + reada > bdev_sectors(miss->bi_bdev))
+-			reada = bdev_sectors(miss->bi_bdev) -
+-				bio_end_sector(miss);
+-	}
++	s->op.replace = KEY(s->op.inode, bio->bi_sector +
++			    s->cache_bio_sectors, s->cache_bio_sectors);
++
++	ret = bch_btree_insert_check_key(b, &s->op, &s->op.replace);
++	if (ret)
++		return ret;
++
++	miss = bch_bio_split(bio, sectors, GFP_NOIO, s->d->bio_split);
++	if (miss == bio)
++		s->op.lookup_done = true;
++	else
++		/* btree_search_recurse()'s btree iterator is no good anymore */
++		ret = -EINTR;
+ 
+-	s->cache_bio_sectors = bio_sectors(miss) + reada;
+ 	s->op.cache_bio = bio_alloc_bioset(GFP_NOWAIT,
+ 			DIV_ROUND_UP(s->cache_bio_sectors, PAGE_SECTORS),
+ 			dc->disk.bio_split);
+@@ -912,11 +916,6 @@ static int cached_dev_cache_miss(struct btree *b, struct search *s,
+ 	s->op.cache_bio->bi_end_io	= request_endio;
+ 	s->op.cache_bio->bi_private	= &s->cl;
+ 
+-	/* btree_search_recurse()'s btree iterator is no good anymore */
+-	ret = -EINTR;
+-	if (!bch_btree_insert_check_key(b, &s->op, s->op.cache_bio))
+-		goto out_put;
+-
+ 	bch_bio_map(s->op.cache_bio, NULL);
+ 	if (bio_alloc_pages(s->op.cache_bio, __GFP_NOWARN|GFP_NOIO))
+ 		goto out_put;
+@@ -931,6 +930,8 @@ out_put:
+ 	bio_put(s->op.cache_bio);
+ 	s->op.cache_bio = NULL;
+ out_submit:
++	miss->bi_end_io		= request_endio;
++	miss->bi_private	= &s->cl;
+ 	closure_bio_submit(miss, &s->cl, s->d);
+ 	return ret;
+ }
+-- 
+2.6.2
+

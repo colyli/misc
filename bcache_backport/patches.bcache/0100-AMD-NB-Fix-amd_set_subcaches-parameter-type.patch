@@ -1,0 +1,52 @@
+From 2993ae3305ad10b41e0d0bc2662f7754ee8e30fa Mon Sep 17 00:00:00 2001
+From: Dan Carpenter <dan.carpenter@oracle.com>
+Date: Tue, 21 Jan 2014 10:22:09 +0300
+Subject: [PATCH 022232/122806] x86/AMD/NB: Fix amd_set_subcaches() parameter
+ type
+
+This is under CAP_SYS_ADMIN, but Smatch complains that mask comes
+from the user and the test for "mask > 0xf" can underflow.
+
+The fix is simple: amd_set_subcaches() should hand down not an 'int'
+but an 'unsigned long' like it was originally indended to do.
+
+Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Acked-by: Borislav Petkov <bp@suse.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Daniel J Blueman <daniel@numascale-asia.com>
+Link: http://lkml.kernel.org/r/20140121072209.GA22095@elgon.mountain
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+---
+ arch/x86/include/asm/amd_nb.h | 2 +-
+ arch/x86/kernel/amd_nb.c      | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/include/asm/amd_nb.h b/arch/x86/include/asm/amd_nb.h
+index a54ee1d..aaac3b2 100644
+--- a/arch/x86/include/asm/amd_nb.h
++++ b/arch/x86/include/asm/amd_nb.h
+@@ -19,7 +19,7 @@ extern int amd_cache_northbridges(void);
+ extern void amd_flush_garts(void);
+ extern int amd_numa_init(void);
+ extern int amd_get_subcaches(int);
+-extern int amd_set_subcaches(int, int);
++extern int amd_set_subcaches(int, unsigned long);
+ 
+ struct amd_l3_cache {
+ 	unsigned indices;
+diff --git a/arch/x86/kernel/amd_nb.c b/arch/x86/kernel/amd_nb.c
+index 59554dc..dec8de4 100644
+--- a/arch/x86/kernel/amd_nb.c
++++ b/arch/x86/kernel/amd_nb.c
+@@ -179,7 +179,7 @@ int amd_get_subcaches(int cpu)
+ 	return (mask >> (4 * cuid)) & 0xf;
+ }
+ 
+-int amd_set_subcaches(int cpu, int mask)
++int amd_set_subcaches(int cpu, unsigned long mask)
+ {
+ 	static unsigned int reset, ban;
+ 	struct amd_northbridge *nb = node_to_amd_nb(amd_get_nb_id(cpu));
+-- 
+2.6.2
+

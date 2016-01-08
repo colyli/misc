@@ -1,0 +1,35 @@
+From 3b3e9e50dd951725130645660b526c4f367dcdee Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Sat, 7 Dec 2013 03:57:58 -0800
+Subject: [PATCH 019191/122806] bcache: Don't return -EINTR when insert
+ finished
+
+We need to return -EINTR after a split because we invalidated iterators
+(and freed the btree node) - but if we were finished inserting, we don't
+want to redo the traversal.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 463d280..98cc0a8 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -2002,8 +2002,10 @@ static int bch_btree_insert_node(struct btree *b, struct btree_op *op,
+ 			return -EINTR;
+ 		} else {
+ 			/* Invalidated all iterators */
+-			return btree_split(b, op, insert_keys, replace_key) ?:
+-				-EINTR;
++			int ret = btree_split(b, op, insert_keys, replace_key);
++
++			return bch_keylist_empty(insert_keys) ?
++				0 : ret ?: -EINTR;
+ 		}
+ 	} else {
+ 		BUG_ON(write_block(b) != btree_bset_last(b));
+-- 
+2.6.2
+

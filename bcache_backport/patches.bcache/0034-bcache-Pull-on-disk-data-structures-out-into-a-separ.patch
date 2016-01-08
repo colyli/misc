@@ -1,0 +1,921 @@
+From 81ab4190ac17df41686a37c97f701623276b652a Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 31 Oct 2013 15:46:42 -0700
+Subject: [PATCH 009464/122806] bcache: Pull on disk data structures out into a
+ separate header
+
+Now, the on disk data structures are in a header that can be exported to
+userspace - and having them all centralized is nice too.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h  | 244 +----------------------------
+ drivers/md/bcache/bset.c    |   4 +-
+ drivers/md/bcache/bset.h    |  31 ----
+ drivers/md/bcache/btree.c   |   2 +-
+ drivers/md/bcache/journal.c |   4 +-
+ drivers/md/bcache/journal.h |  37 -----
+ drivers/md/bcache/request.c |   9 +-
+ drivers/md/bcache/super.c   |  13 +-
+ drivers/md/bcache/util.h    |  10 --
+ include/uapi/linux/bcache.h | 373 ++++++++++++++++++++++++++++++++++++++++++++
+ 10 files changed, 387 insertions(+), 340 deletions(-)
+ create mode 100644 include/uapi/linux/bcache.h
+
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bcache.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bcache.h
+@@ -177,6 +177,7 @@
+ 
+ #define pr_fmt(fmt) "bcache: %s() " fmt "\n", __func__
+ 
++#include <linux/bcache.h>
+ #include <linux/bio.h>
+ #include <linux/kobject.h>
+ #include <linux/list.h>
+@@ -210,168 +211,6 @@ BITMASK(GC_MARK,	 struct bucket, gc_mark
+ #define GC_MARK_METADATA	2
+ BITMASK(GC_SECTORS_USED, struct bucket, gc_mark, 2, 14);
+ 
+-struct bkey {
+-	uint64_t	high;
+-	uint64_t	low;
+-	uint64_t	ptr[];
+-};
+-
+-/* Enough for a key with 6 pointers */
+-#define BKEY_PAD		8
+-
+-#define BKEY_PADDED(key)					\
+-	union { struct bkey key; uint64_t key ## _pad[BKEY_PAD]; }
+-
+-/* Version 0: Cache device
+- * Version 1: Backing device
+- * Version 2: Seed pointer into btree node checksum
+- * Version 3: Cache device with new UUID format
+- * Version 4: Backing device with data offset
+- */
+-#define BCACHE_SB_VERSION_CDEV			0
+-#define BCACHE_SB_VERSION_BDEV			1
+-#define BCACHE_SB_VERSION_CDEV_WITH_UUID	3
+-#define BCACHE_SB_VERSION_BDEV_WITH_OFFSET	4
+-#define BCACHE_SB_MAX_VERSION			4
+-
+-#define SB_SECTOR		8
+-#define SB_SIZE			4096
+-#define SB_LABEL_SIZE		32
+-#define SB_JOURNAL_BUCKETS	256U
+-/* SB_JOURNAL_BUCKETS must be divisible by BITS_PER_LONG */
+-#define MAX_CACHES_PER_SET	8
+-
+-#define BDEV_DATA_START_DEFAULT	16	/* sectors */
+-
+-struct cache_sb {
+-	uint64_t		csum;
+-	uint64_t		offset;	/* sector where this sb was written */
+-	uint64_t		version;
+-
+-	uint8_t			magic[16];
+-
+-	uint8_t			uuid[16];
+-	union {
+-		uint8_t		set_uuid[16];
+-		uint64_t	set_magic;
+-	};
+-	uint8_t			label[SB_LABEL_SIZE];
+-
+-	uint64_t		flags;
+-	uint64_t		seq;
+-	uint64_t		pad[8];
+-
+-	union {
+-	struct {
+-		/* Cache devices */
+-		uint64_t	nbuckets;	/* device size */
+-
+-		uint16_t	block_size;	/* sectors */
+-		uint16_t	bucket_size;	/* sectors */
+-
+-		uint16_t	nr_in_set;
+-		uint16_t	nr_this_dev;
+-	};
+-	struct {
+-		/* Backing devices */
+-		uint64_t	data_offset;
+-
+-		/*
+-		 * block_size from the cache device section is still used by
+-		 * backing devices, so don't add anything here until we fix
+-		 * things to not need it for backing devices anymore
+-		 */
+-	};
+-	};
+-
+-	uint32_t		last_mount;	/* time_t */
+-
+-	uint16_t		first_bucket;
+-	union {
+-		uint16_t	njournal_buckets;
+-		uint16_t	keys;
+-	};
+-	uint64_t		d[SB_JOURNAL_BUCKETS];	/* journal buckets */
+-};
+-
+-BITMASK(CACHE_SYNC,		struct cache_sb, flags, 0, 1);
+-BITMASK(CACHE_DISCARD,		struct cache_sb, flags, 1, 1);
+-BITMASK(CACHE_REPLACEMENT,	struct cache_sb, flags, 2, 3);
+-#define CACHE_REPLACEMENT_LRU	0U
+-#define CACHE_REPLACEMENT_FIFO	1U
+-#define CACHE_REPLACEMENT_RANDOM 2U
+-
+-BITMASK(BDEV_CACHE_MODE,	struct cache_sb, flags, 0, 4);
+-#define CACHE_MODE_WRITETHROUGH	0U
+-#define CACHE_MODE_WRITEBACK	1U
+-#define CACHE_MODE_WRITEAROUND	2U
+-#define CACHE_MODE_NONE		3U
+-BITMASK(BDEV_STATE,		struct cache_sb, flags, 61, 2);
+-#define BDEV_STATE_NONE		0U
+-#define BDEV_STATE_CLEAN	1U
+-#define BDEV_STATE_DIRTY	2U
+-#define BDEV_STATE_STALE	3U
+-
+-/* Version 1: Seed pointer into btree node checksum
+- */
+-#define BCACHE_BSET_VERSION	1
+-
+-/*
+- * This is the on disk format for btree nodes - a btree node on disk is a list
+- * of these; within each set the keys are sorted
+- */
+-struct bset {
+-	uint64_t		csum;
+-	uint64_t		magic;
+-	uint64_t		seq;
+-	uint32_t		version;
+-	uint32_t		keys;
+-
+-	union {
+-		struct bkey	start[0];
+-		uint64_t	d[0];
+-	};
+-};
+-
+-/*
+- * On disk format for priorities and gens - see super.c near prio_write() for
+- * more.
+- */
+-struct prio_set {
+-	uint64_t		csum;
+-	uint64_t		magic;
+-	uint64_t		seq;
+-	uint32_t		version;
+-	uint32_t		pad;
+-
+-	uint64_t		next_bucket;
+-
+-	struct bucket_disk {
+-		uint16_t	prio;
+-		uint8_t		gen;
+-	} __attribute((packed)) data[];
+-};
+-
+-struct uuid_entry {
+-	union {
+-		struct {
+-			uint8_t		uuid[16];
+-			uint8_t		label[32];
+-			uint32_t	first_reg;
+-			uint32_t	last_reg;
+-			uint32_t	invalidated;
+-
+-			uint32_t	flags;
+-			/* Size of flash only volumes */
+-			uint64_t	sectors;
+-		};
+-
+-		uint8_t	pad[128];
+-	};
+-};
+-
+-BITMASK(UUID_FLASH_ONLY,	struct uuid_entry, flags, 0, 1);
+-
+ #include "journal.h"
+ #include "stats.h"
+ struct search;
+@@ -872,12 +711,6 @@ static inline bool key_merging_disabled(
+ #endif
+ }
+ 
+-static inline bool SB_IS_BDEV(const struct cache_sb *sb)
+-{
+-	return sb->version == BCACHE_SB_VERSION_BDEV
+-		|| sb->version == BCACHE_SB_VERSION_BDEV_WITH_OFFSET;
+-}
+-
+ struct bbio {
+ 	unsigned		submit_time_us;
+ 	union {
+@@ -931,59 +764,6 @@ static inline unsigned local_clock_us(vo
+ #define prio_buckets(c)					\
+ 	DIV_ROUND_UP((size_t) (c)->sb.nbuckets, prios_per_bucket(c))
+ 
+-#define JSET_MAGIC		0x245235c1a3625032ULL
+-#define PSET_MAGIC		0x6750e15f87337f91ULL
+-#define BSET_MAGIC		0x90135c78b99e07f5ULL
+-
+-#define jset_magic(c)		((c)->sb.set_magic ^ JSET_MAGIC)
+-#define pset_magic(c)		((c)->sb.set_magic ^ PSET_MAGIC)
+-#define bset_magic(c)		((c)->sb.set_magic ^ BSET_MAGIC)
+-
+-/* Bkey fields: all units are in sectors */
+-
+-#define KEY_FIELD(name, field, offset, size)				\
+-	BITMASK(name, struct bkey, field, offset, size)
+-
+-#define PTR_FIELD(name, offset, size)					\
+-	static inline uint64_t name(const struct bkey *k, unsigned i)	\
+-	{ return (k->ptr[i] >> offset) & ~(((uint64_t) ~0) << size); }	\
+-									\
+-	static inline void SET_##name(struct bkey *k, unsigned i, uint64_t v)\
+-	{								\
+-		k->ptr[i] &= ~(~((uint64_t) ~0 << size) << offset);	\
+-		k->ptr[i] |= v << offset;				\
+-	}
+-
+-KEY_FIELD(KEY_PTRS,	high, 60, 3)
+-KEY_FIELD(HEADER_SIZE,	high, 58, 2)
+-KEY_FIELD(KEY_CSUM,	high, 56, 2)
+-KEY_FIELD(KEY_PINNED,	high, 55, 1)
+-KEY_FIELD(KEY_DIRTY,	high, 36, 1)
+-
+-KEY_FIELD(KEY_SIZE,	high, 20, 16)
+-KEY_FIELD(KEY_INODE,	high, 0,  20)
+-
+-/* Next time I change the on disk format, KEY_OFFSET() won't be 64 bits */
+-
+-static inline uint64_t KEY_OFFSET(const struct bkey *k)
+-{
+-	return k->low;
+-}
+-
+-static inline void SET_KEY_OFFSET(struct bkey *k, uint64_t v)
+-{
+-	k->low = v;
+-}
+-
+-PTR_FIELD(PTR_DEV,		51, 12)
+-PTR_FIELD(PTR_OFFSET,		8,  43)
+-PTR_FIELD(PTR_GEN,		0,  8)
+-
+-#define PTR_CHECK_DEV		((1 << 12) - 1)
+-
+-#define PTR(gen, offset, dev)						\
+-	((((uint64_t) dev) << 51) | ((uint64_t) offset) << 8 | gen)
+-
+ static inline size_t sector_to_bucket(struct cache_set *c, sector_t s)
+ {
+ 	return s >> c->bucket_bits;
+@@ -1022,31 +802,11 @@ static inline struct bucket *PTR_BUCKET(
+ 
+ /* Btree key macros */
+ 
+-/*
+- * The high bit being set is a relic from when we used it to do binary
+- * searches - it told you where a key started. It's not used anymore,
+- * and can probably be safely dropped.
+- */
+-#define KEY(dev, sector, len)						\
+-((struct bkey) {							\
+-	.high = (1ULL << 63) | ((uint64_t) (len) << 20) | (dev),	\
+-	.low = (sector)							\
+-})
+-
+ static inline void bkey_init(struct bkey *k)
+ {
+-	*k = KEY(0, 0, 0);
++	*k = ZERO_KEY;
+ }
+ 
+-#define KEY_START(k)		(KEY_OFFSET(k) - KEY_SIZE(k))
+-#define START_KEY(k)		KEY(KEY_INODE(k), KEY_START(k), 0)
+-
+-#define MAX_KEY_INODE		(~(~0 << 20))
+-#define MAX_KEY_OFFSET		(((uint64_t) ~0) >> 1)
+-#define MAX_KEY			KEY(MAX_KEY_INODE, MAX_KEY_OFFSET, 0)
+-
+-#define ZERO_KEY		KEY(0, 0, 0)
+-
+ /*
+  * This is used for various on disk data structures - cache_sb, prio_set, bset,
+  * jset: The checksum is _always_ the first 8 bytes of these structs
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bset.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bset.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bset.c
+@@ -684,7 +684,7 @@ void bch_bset_init_next(struct btree *b)
+ 	} else
+ 		get_random_bytes(&i->seq, sizeof(uint64_t));
+ 
+-	i->magic	= bset_magic(b->c);
++	i->magic	= bset_magic(&b->c->sb);
+ 	i->version	= 0;
+ 	i->keys		= 0;
+ 
+@@ -1052,7 +1052,7 @@ static void __btree_sort(struct btree *b
+ 		 * memcpy()
+ 		 */
+ 
+-		out->magic	= bset_magic(b->c);
++		out->magic	= bset_magic(&b->c->sb);
+ 		out->seq	= b->sets[0].data->seq;
+ 		out->version	= b->sets[0].data->version;
+ 		swap(out, b->sets[0].data);
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bset.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bset.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bset.h
+@@ -193,37 +193,6 @@ static __always_inline int64_t bkey_cmp(
+ 		: (int64_t) KEY_OFFSET(l) - (int64_t) KEY_OFFSET(r);
+ }
+ 
+-static inline size_t bkey_u64s(const struct bkey *k)
+-{
+-	BUG_ON(KEY_CSUM(k) > 1);
+-	return 2 + KEY_PTRS(k) + (KEY_CSUM(k) ? 1 : 0);
+-}
+-
+-static inline size_t bkey_bytes(const struct bkey *k)
+-{
+-	return bkey_u64s(k) * sizeof(uint64_t);
+-}
+-
+-static inline void bkey_copy(struct bkey *dest, const struct bkey *src)
+-{
+-	memcpy(dest, src, bkey_bytes(src));
+-}
+-
+-static inline void bkey_copy_key(struct bkey *dest, const struct bkey *src)
+-{
+-	if (!src)
+-		src = &KEY(0, 0, 0);
+-
+-	SET_KEY_INODE(dest, KEY_INODE(src));
+-	SET_KEY_OFFSET(dest, KEY_OFFSET(src));
+-}
+-
+-static inline struct bkey *bkey_next(const struct bkey *k)
+-{
+-	uint64_t *d = (void *) k;
+-	return (struct bkey *) (d + bkey_u64s(k));
+-}
+-
+ /* Keylists */
+ 
+ struct keylist {
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/btree.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/btree.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/btree.c
+@@ -231,7 +231,7 @@ static void bch_btree_node_read_done(str
+ 			goto err;
+ 
+ 		err = "bad magic";
+-		if (i->magic != bset_magic(b->c))
++		if (i->magic != bset_magic(&b->c->sb))
+ 			goto err;
+ 
+ 		err = "bad checksum";
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/journal.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/journal.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/journal.c
+@@ -74,7 +74,7 @@ reread:		left = ca->sb.bucket_size - off
+ 			struct list_head *where;
+ 			size_t blocks, bytes = set_bytes(j);
+ 
+-			if (j->magic != jset_magic(ca->set)) {
++			if (j->magic != jset_magic(&ca->sb)) {
+ 				pr_debug("%u: bad magic", bucket_index);
+ 				return ret;
+ 			}
+@@ -605,7 +605,7 @@ static void journal_write_unlocked(struc
+ 	for_each_cache(ca, c, i)
+ 		w->data->prio_bucket[ca->sb.nr_this_dev] = ca->prio_buckets[0];
+ 
+-	w->data->magic		= jset_magic(c);
++	w->data->magic		= jset_magic(&c->sb);
+ 	w->data->version	= BCACHE_JSET_VERSION;
+ 	w->data->last_seq	= last_seq(&c->journal);
+ 	w->data->csum		= csum_set(w->data);
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/journal.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/journal.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/journal.h
+@@ -75,43 +75,6 @@
+  * nodes that are pinning the oldest journal entries first.
+  */
+ 
+-#define BCACHE_JSET_VERSION_UUIDv1	1
+-/* Always latest UUID format */
+-#define BCACHE_JSET_VERSION_UUID	1
+-#define BCACHE_JSET_VERSION		1
+-
+-/*
+- * On disk format for a journal entry:
+- * seq is monotonically increasing; every journal entry has its own unique
+- * sequence number.
+- *
+- * last_seq is the oldest journal entry that still has keys the btree hasn't
+- * flushed to disk yet.
+- *
+- * version is for on disk format changes.
+- */
+-struct jset {
+-	uint64_t		csum;
+-	uint64_t		magic;
+-	uint64_t		seq;
+-	uint32_t		version;
+-	uint32_t		keys;
+-
+-	uint64_t		last_seq;
+-
+-	BKEY_PADDED(uuid_bucket);
+-	BKEY_PADDED(btree_root);
+-	uint16_t		btree_level;
+-	uint16_t		pad[3];
+-
+-	uint64_t		prio_bucket[MAX_CACHES_PER_SET];
+-
+-	union {
+-		struct bkey	start[0];
+-		uint64_t	d[0];
+-	};
+-};
+-
+ /*
+  * Only used for holding the journal entries we read in btree_journal_read()
+  * during cache_registration
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/request.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+@@ -264,16 +264,17 @@ static void bch_data_invalidate(struct c
+ 		 bio_sectors(bio), (uint64_t) bio->bi_sector);
+ 
+ 	while (bio_sectors(bio)) {
+-		unsigned len = min(bio_sectors(bio), 1U << 14);
++		unsigned sectors = min(bio_sectors(bio),
++				       1U << (KEY_SIZE_BITS - 1));
+ 
+ 		if (bch_keylist_realloc(&op->insert_keys, 0, op->c))
+ 			goto out;
+ 
+-		bio->bi_sector	+= len;
+-		bio->bi_size	-= len << 9;
++		bio->bi_sector	+= sectors;
++		bio->bi_size	-= sectors << 9;
+ 
+ 		bch_keylist_add(&op->insert_keys,
+-				&KEY(op->inode, bio->bi_sector, len));
++				&KEY(op->inode, bio->bi_sector, sectors));
+ 	}
+ 
+ 	op->insert_data_done = true;
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/super.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/super.c
+@@ -45,15 +45,6 @@ const char * const bch_cache_modes[] = {
+ 	NULL
+ };
+ 
+-struct uuid_entry_v0 {
+-	uint8_t		uuid[16];
+-	uint8_t		label[32];
+-	uint32_t	first_reg;
+-	uint32_t	last_reg;
+-	uint32_t	invalidated;
+-	uint32_t	pad;
+-};
+-
+ static struct kobject *bcache_kobj;
+ struct mutex bch_register_lock;
+ LIST_HEAD(bch_cache_sets);
+@@ -562,7 +553,7 @@ void bch_prio_write(struct cache *ca)
+ 		}
+ 
+ 		p->next_bucket	= ca->prio_buckets[i + 1];
+-		p->magic	= pset_magic(ca);
++		p->magic	= pset_magic(&ca->sb);
+ 		p->csum		= bch_crc64(&p->magic, bucket_bytes(ca) - 8);
+ 
+ 		bucket = bch_bucket_alloc(ca, WATERMARK_PRIO, true);
+@@ -613,7 +604,7 @@ static void prio_read(struct cache *ca,
+ 			if (p->csum != bch_crc64(&p->magic, bucket_bytes(ca) - 8))
+ 				pr_warn("bad csum reading priorities");
+ 
+-			if (p->magic != pset_magic(ca))
++			if (p->magic != pset_magic(&ca->sb))
+ 				pr_warn("bad magic reading priorities");
+ 
+ 			bucket = p->next_bucket;
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/util.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/util.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/util.h
+@@ -27,16 +27,6 @@ struct closure;
+ 
+ #endif
+ 
+-#define BITMASK(name, type, field, offset, size)		\
+-static inline uint64_t name(const type *k)			\
+-{ return (k->field >> offset) & ~(((uint64_t) ~0) << size); }	\
+-								\
+-static inline void SET_##name(type *k, uint64_t v)		\
+-{								\
+-	k->field &= ~(~((uint64_t) ~0 << size) << offset);	\
+-	k->field |= v << offset;				\
+-}
+-
+ #define DECLARE_HEAP(type, name)					\
+ 	struct {							\
+ 		size_t size, used;					\
+Index: linux-3.12-SLE12-SP1/include/uapi/linux/bcache.h
+===================================================================
+--- /dev/null
++++ linux-3.12-SLE12-SP1/include/uapi/linux/bcache.h
+@@ -0,0 +1,373 @@
++#ifndef _LINUX_BCACHE_H
++#define _LINUX_BCACHE_H
++
++/*
++ * Bcache on disk data structures
++ */
++
++#include <asm/types.h>
++
++#define BITMASK(name, type, field, offset, size)		\
++static inline __u64 name(const type *k)				\
++{ return (k->field >> offset) & ~(~0ULL << size); }		\
++								\
++static inline void SET_##name(type *k, __u64 v)			\
++{								\
++	k->field &= ~(~(~0ULL << size) << offset);		\
++	k->field |= (v & ~(~0ULL << size)) << offset;		\
++}
++
++/* Btree keys - all units are in sectors */
++
++struct bkey {
++	__u64	high;
++	__u64	low;
++	__u64	ptr[];
++};
++
++#define KEY_FIELD(name, field, offset, size)				\
++	BITMASK(name, struct bkey, field, offset, size)
++
++#define PTR_FIELD(name, offset, size)					\
++static inline __u64 name(const struct bkey *k, unsigned i)		\
++{ return (k->ptr[i] >> offset) & ~(~0ULL << size); }			\
++									\
++static inline void SET_##name(struct bkey *k, unsigned i, __u64 v)	\
++{									\
++	k->ptr[i] &= ~(~(~0ULL << size) << offset);			\
++	k->ptr[i] |= (v & ~(~0ULL << size)) << offset;			\
++}
++
++#define KEY_SIZE_BITS		16
++
++KEY_FIELD(KEY_PTRS,	high, 60, 3)
++KEY_FIELD(HEADER_SIZE,	high, 58, 2)
++KEY_FIELD(KEY_CSUM,	high, 56, 2)
++KEY_FIELD(KEY_PINNED,	high, 55, 1)
++KEY_FIELD(KEY_DIRTY,	high, 36, 1)
++
++KEY_FIELD(KEY_SIZE,	high, 20, KEY_SIZE_BITS)
++KEY_FIELD(KEY_INODE,	high, 0,  20)
++
++/* Next time I change the on disk format, KEY_OFFSET() won't be 64 bits */
++
++static inline __u64 KEY_OFFSET(const struct bkey *k)
++{
++	return k->low;
++}
++
++static inline void SET_KEY_OFFSET(struct bkey *k, __u64 v)
++{
++	k->low = v;
++}
++
++/*
++ * The high bit being set is a relic from when we used it to do binary
++ * searches - it told you where a key started. It's not used anymore,
++ * and can probably be safely dropped.
++ */
++#define KEY(inode, offset, size)					\
++((struct bkey) {							\
++	.high = (1ULL << 63) | ((__u64) (size) << 20) | (inode),	\
++	.low = (offset)							\
++})
++
++#define ZERO_KEY			KEY(0, 0, 0)
++
++#define MAX_KEY_INODE			(~(~0 << 20))
++#define MAX_KEY_OFFSET			(~0ULL >> 1)
++#define MAX_KEY				KEY(MAX_KEY_INODE, MAX_KEY_OFFSET, 0)
++
++#define KEY_START(k)			(KEY_OFFSET(k) - KEY_SIZE(k))
++#define START_KEY(k)			KEY(KEY_INODE(k), KEY_START(k), 0)
++
++#define PTR_DEV_BITS			12
++
++PTR_FIELD(PTR_DEV,			51, PTR_DEV_BITS)
++PTR_FIELD(PTR_OFFSET,			8,  43)
++PTR_FIELD(PTR_GEN,			0,  8)
++
++#define PTR_CHECK_DEV			((1 << PTR_DEV_BITS) - 1)
++
++#define PTR(gen, offset, dev)						\
++	((((__u64) dev) << 51) | ((__u64) offset) << 8 | gen)
++
++/* Bkey utility code */
++
++static inline unsigned long bkey_u64s(const struct bkey *k)
++{
++	return (sizeof(struct bkey) / sizeof(__u64)) + KEY_PTRS(k);
++}
++
++static inline unsigned long bkey_bytes(const struct bkey *k)
++{
++	return bkey_u64s(k) * sizeof(__u64);
++}
++
++#define bkey_copy(_dest, _src)	memcpy(_dest, _src, bkey_bytes(_src))
++
++static inline void bkey_copy_key(struct bkey *dest, const struct bkey *src)
++{
++	SET_KEY_INODE(dest, KEY_INODE(src));
++	SET_KEY_OFFSET(dest, KEY_OFFSET(src));
++}
++
++static inline struct bkey *bkey_next(const struct bkey *k)
++{
++	__u64 *d = (void *) k;
++	return (struct bkey *) (d + bkey_u64s(k));
++}
++
++static inline struct bkey *bkey_last(const struct bkey *k, unsigned nr_keys)
++{
++	__u64 *d = (void *) k;
++	return (struct bkey *) (d + nr_keys);
++}
++/* Enough for a key with 6 pointers */
++#define BKEY_PAD		8
++
++#define BKEY_PADDED(key)					\
++	union { struct bkey key; __u64 key ## _pad[BKEY_PAD]; }
++
++/* Superblock */
++
++/* Version 0: Cache device
++ * Version 1: Backing device
++ * Version 2: Seed pointer into btree node checksum
++ * Version 3: Cache device with new UUID format
++ * Version 4: Backing device with data offset
++ */
++#define BCACHE_SB_VERSION_CDEV		0
++#define BCACHE_SB_VERSION_BDEV		1
++#define BCACHE_SB_VERSION_CDEV_WITH_UUID 3
++#define BCACHE_SB_VERSION_BDEV_WITH_OFFSET 4
++#define BCACHE_SB_MAX_VERSION		4
++
++#define SB_SECTOR			8
++#define SB_SIZE				4096
++#define SB_LABEL_SIZE			32
++#define SB_JOURNAL_BUCKETS		256U
++/* SB_JOURNAL_BUCKETS must be divisible by BITS_PER_LONG */
++#define MAX_CACHES_PER_SET		8
++
++#define BDEV_DATA_START_DEFAULT		16	/* sectors */
++
++struct cache_sb {
++	__u64			csum;
++	__u64			offset;	/* sector where this sb was written */
++	__u64			version;
++
++	__u8			magic[16];
++
++	__u8			uuid[16];
++	union {
++		__u8		set_uuid[16];
++		__u64		set_magic;
++	};
++	__u8			label[SB_LABEL_SIZE];
++
++	__u64			flags;
++	__u64			seq;
++	__u64			pad[8];
++
++	union {
++	struct {
++		/* Cache devices */
++		__u64		nbuckets;	/* device size */
++
++		__u16		block_size;	/* sectors */
++		__u16		bucket_size;	/* sectors */
++
++		__u16		nr_in_set;
++		__u16		nr_this_dev;
++	};
++	struct {
++		/* Backing devices */
++		__u64		data_offset;
++
++		/*
++		 * block_size from the cache device section is still used by
++		 * backing devices, so don't add anything here until we fix
++		 * things to not need it for backing devices anymore
++		 */
++	};
++	};
++
++	__u32			last_mount;	/* time_t */
++
++	__u16			first_bucket;
++	union {
++		__u16		njournal_buckets;
++		__u16		keys;
++	};
++	__u64			d[SB_JOURNAL_BUCKETS];	/* journal buckets */
++};
++
++static inline _Bool SB_IS_BDEV(const struct cache_sb *sb)
++{
++	return sb->version == BCACHE_SB_VERSION_BDEV
++		|| sb->version == BCACHE_SB_VERSION_BDEV_WITH_OFFSET;
++}
++
++BITMASK(CACHE_SYNC,			struct cache_sb, flags, 0, 1);
++BITMASK(CACHE_DISCARD,			struct cache_sb, flags, 1, 1);
++BITMASK(CACHE_REPLACEMENT,		struct cache_sb, flags, 2, 3);
++#define CACHE_REPLACEMENT_LRU		0U
++#define CACHE_REPLACEMENT_FIFO		1U
++#define CACHE_REPLACEMENT_RANDOM	2U
++
++BITMASK(BDEV_CACHE_MODE,		struct cache_sb, flags, 0, 4);
++#define CACHE_MODE_WRITETHROUGH		0U
++#define CACHE_MODE_WRITEBACK		1U
++#define CACHE_MODE_WRITEAROUND		2U
++#define CACHE_MODE_NONE			3U
++BITMASK(BDEV_STATE,			struct cache_sb, flags, 61, 2);
++#define BDEV_STATE_NONE			0U
++#define BDEV_STATE_CLEAN		1U
++#define BDEV_STATE_DIRTY		2U
++#define BDEV_STATE_STALE		3U
++
++/*
++ * Magic numbers
++ *
++ * The various other data structures have their own magic numbers, which are
++ * xored with the first part of the cache set's UUID
++ */
++
++#define JSET_MAGIC			0x245235c1a3625032ULL
++#define PSET_MAGIC			0x6750e15f87337f91ULL
++#define BSET_MAGIC			0x90135c78b99e07f5ULL
++
++static inline __u64 jset_magic(struct cache_sb *sb)
++{
++	return sb->set_magic ^ JSET_MAGIC;
++}
++
++static inline __u64 pset_magic(struct cache_sb *sb)
++{
++	return sb->set_magic ^ PSET_MAGIC;
++}
++
++static inline __u64 bset_magic(struct cache_sb *sb)
++{
++	return sb->set_magic ^ BSET_MAGIC;
++}
++
++/*
++ * Journal
++ *
++ * On disk format for a journal entry:
++ * seq is monotonically increasing; every journal entry has its own unique
++ * sequence number.
++ *
++ * last_seq is the oldest journal entry that still has keys the btree hasn't
++ * flushed to disk yet.
++ *
++ * version is for on disk format changes.
++ */
++
++#define BCACHE_JSET_VERSION_UUIDv1	1
++#define BCACHE_JSET_VERSION_UUID	1	/* Always latest UUID format */
++#define BCACHE_JSET_VERSION		1
++
++struct jset {
++	__u64			csum;
++	__u64			magic;
++	__u64			seq;
++	__u32			version;
++	__u32			keys;
++
++	__u64			last_seq;
++
++	BKEY_PADDED(uuid_bucket);
++	BKEY_PADDED(btree_root);
++	__u16			btree_level;
++	__u16			pad[3];
++
++	__u64			prio_bucket[MAX_CACHES_PER_SET];
++
++	union {
++		struct bkey	start[0];
++		__u64		d[0];
++	};
++};
++
++/* Bucket prios/gens */
++
++struct prio_set {
++	__u64			csum;
++	__u64			magic;
++	__u64			seq;
++	__u32			version;
++	__u32			pad;
++
++	__u64			next_bucket;
++
++	struct bucket_disk {
++		__u16		prio;
++		__u8		gen;
++	} __attribute((packed)) data[];
++};
++
++/* UUIDS - per backing device/flash only volume metadata */
++
++struct uuid_entry {
++	union {
++		struct {
++			__u8	uuid[16];
++			__u8	label[32];
++			__u32	first_reg;
++			__u32	last_reg;
++			__u32	invalidated;
++
++			__u32	flags;
++			/* Size of flash only volumes */
++			__u64	sectors;
++		};
++
++		__u8		pad[128];
++	};
++};
++
++BITMASK(UUID_FLASH_ONLY,	struct uuid_entry, flags, 0, 1);
++
++/* Btree nodes */
++
++/* Version 1: Seed pointer into btree node checksum
++ */
++#define BCACHE_BSET_CSUM		1
++#define BCACHE_BSET_VERSION		1
++
++/*
++ * Btree nodes
++ *
++ * On disk a btree node is a list/log of these; within each set the keys are
++ * sorted
++ */
++struct bset {
++	__u64			csum;
++	__u64			magic;
++	__u64			seq;
++	__u32			version;
++	__u32			keys;
++
++	union {
++		struct bkey	start[0];
++		__u64		d[0];
++	};
++};
++
++/* OBSOLETE */
++
++/* UUIDS - per backing device/flash only volume metadata */
++
++struct uuid_entry_v0 {
++	__u8		uuid[16];
++	__u8		label[32];
++	__u32		first_reg;
++	__u32		last_reg;
++	__u32		invalidated;
++	__u32		pad;
++};
++
++#endif /* _LINUX_BCACHE_H */

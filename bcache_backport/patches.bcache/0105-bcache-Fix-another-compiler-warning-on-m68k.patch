@@ -1,0 +1,31 @@
+From 85cbe1f88cb189322e3e4ef98816c19ab12161ea Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 17 Feb 2014 13:44:06 -0800
+Subject: [PATCH 026389/122806] bcache: Fix another compiler warning on m68k
+
+Use a bigger hammer this time
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+Cc: linux-stable <stable@vger.kernel.org>
+---
+ drivers/md/bcache/bset.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index 3f74b4b..5454164 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -23,8 +23,8 @@ void bch_dump_bset(struct btree_keys *b, struct bset *i, unsigned set)
+ 	for (k = i->start; k < bset_bkey_last(i); k = next) {
+ 		next = bkey_next(k);
+ 
+-		printk(KERN_ERR "block %u key %li/%u: ", set,
+-		       (uint64_t *) k - i->d, i->keys);
++		printk(KERN_ERR "block %u key %u/%u: ", set,
++		       (unsigned) ((u64 *) k - i->d), i->keys);
+ 
+ 		if (b->ops->key_dump)
+ 			b->ops->key_dump(b, k);
+-- 
+2.6.2
+

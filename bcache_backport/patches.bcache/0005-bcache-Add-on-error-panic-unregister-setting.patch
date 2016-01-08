@@ -1,0 +1,140 @@
+From 77c320eb46e216c17aee5c943949229ccfed6904 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 11 Jul 2013 19:42:51 -0700
+Subject: [PATCH 009435/122806] bcache: Add on error panic/unregister setting
+
+Works kind of like the ext4 setting, to panic or remount read only on
+errors.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h  |  6 ++++++
+ drivers/md/bcache/journal.c |  7 +++----
+ drivers/md/bcache/super.c   |  6 +++++-
+ drivers/md/bcache/sysfs.c   | 21 +++++++++++++++++++++
+ 4 files changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index bf37474..5786156 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -843,8 +843,14 @@ struct cache_set {
+ 	atomic_long_t		cache_read_races;
+ 	atomic_long_t		writeback_keys_done;
+ 	atomic_long_t		writeback_keys_failed;
++
++	enum			{
++		ON_ERROR_UNREGISTER,
++		ON_ERROR_PANIC,
++	}			on_error;
+ 	unsigned		error_limit;
+ 	unsigned		error_decay;
++
+ 	unsigned short		journal_delay_ms;
+ 	unsigned		verify:1;
+ 	unsigned		key_merging_disabled:1;
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 7c9e6bf..9e87758 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -305,10 +305,9 @@ int bch_journal_replay(struct cache_set *s, struct list_head *list,
+ 	list_for_each_entry(i, list, list) {
+ 		BUG_ON(i->pin && atomic_read(i->pin) != 1);
+ 
+-		if (n != i->j.seq)
+-			pr_err(
+-		"journal entries %llu-%llu missing! (replaying %llu-%llu)\n",
+-		n, i->j.seq - 1, start, end);
++		cache_set_err_on(n != i->j.seq, s,
++"bcache: journal entries %llu-%llu missing! (replaying %llu-%llu)",
++				 n, i->j.seq - 1, start, end);
+ 
+ 		for (k = i->j.start;
+ 		     k < end(&i->j);
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index fd37342..74f2e90 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1260,7 +1260,8 @@ bool bch_cache_set_error(struct cache_set *c, const char *fmt, ...)
+ {
+ 	va_list args;
+ 
+-	if (test_bit(CACHE_SET_STOPPING, &c->flags))
++	if (c->on_error != ON_ERROR_PANIC &&
++	    test_bit(CACHE_SET_STOPPING, &c->flags))
+ 		return false;
+ 
+ 	/* XXX: we can be called from atomic context
+@@ -1275,6 +1276,9 @@ bool bch_cache_set_error(struct cache_set *c, const char *fmt, ...)
+ 
+ 	printk(", disabling caching\n");
+ 
++	if (c->on_error == ON_ERROR_PANIC)
++		panic("panic forced after error\n");
++
+ 	bch_cache_set_unregister(c);
+ 	return true;
+ }
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index 924dcfd..4211d82 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -21,6 +21,12 @@ static const char * const cache_replacement_policies[] = {
+ 	NULL
+ };
+ 
++static const char * const error_actions[] = {
++	"unregister",
++	"panic",
++	NULL
++};
++
+ write_attribute(attach);
+ write_attribute(detach);
+ write_attribute(unregister);
+@@ -90,6 +96,7 @@ rw_attribute(discard);
+ rw_attribute(running);
+ rw_attribute(label);
+ rw_attribute(readahead);
++rw_attribute(errors);
+ rw_attribute(io_error_limit);
+ rw_attribute(io_error_halflife);
+ rw_attribute(verify);
+@@ -492,6 +499,10 @@ lock_root:
+ 	sysfs_print(writeback_keys_failed,
+ 		    atomic_long_read(&c->writeback_keys_failed));
+ 
++	if (attr == &sysfs_errors)
++		return bch_snprint_string_list(buf, PAGE_SIZE, error_actions,
++					       c->on_error);
++
+ 	/* See count_io_errors for why 88 */
+ 	sysfs_print(io_error_halflife,	c->error_decay * 88);
+ 	sysfs_print(io_error_limit,	c->error_limit >> IO_ERROR_SHIFT);
+@@ -569,6 +580,15 @@ STORE(__bch_cache_set)
+ 	sysfs_strtoul(congested_write_threshold_us,
+ 		      c->congested_write_threshold_us);
+ 
++	if (attr == &sysfs_errors) {
++		ssize_t v = bch_read_string_list(buf, error_actions);
++
++		if (v < 0)
++			return v;
++
++		c->on_error = v;
++	}
++
+ 	if (attr == &sysfs_io_error_limit)
+ 		c->error_limit = strtoul_or_return(buf) << IO_ERROR_SHIFT;
+ 
+@@ -620,6 +640,7 @@ static struct attribute *bch_cache_set_files[] = {
+ 	&sysfs_average_key_size,
+ 	&sysfs_dirty_data,
+ 
++	&sysfs_errors,
+ 	&sysfs_io_error_limit,
+ 	&sysfs_io_error_halflife,
+ 	&sysfs_congested,
+-- 
+2.6.2
+

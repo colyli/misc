@@ -1,0 +1,100 @@
+From 981aa8c091e164ea51dd1e81b71a1f3852bbcceb Mon Sep 17 00:00:00 2001
+From: Nicholas Swenson <nks@daterainc.com>
+Date: Thu, 7 Nov 2013 17:53:19 -0800
+Subject: [PATCH 015433/122806] bcache: bugfix - moving_gc now moves only
+ correct buckets
+
+Removed gc_move_threshold because picking buckets only by
+threshold could lead moving extra buckets (ei. if there are
+buckets at the threshold that aren't supposed to be moved
+do to space considerations).
+
+This is replaced by a GC_MOVE bit in the gc_mark bitmask.
+Now only marked buckets get moved.
+
+Signed-off-by: Nicholas Swenson <nks@daterainc.com>
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/alloc.c    | 2 ++
+ drivers/md/bcache/bcache.h   | 6 +++---
+ drivers/md/bcache/movinggc.c | 8 +++-----
+ 3 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/md/bcache/alloc.c b/drivers/md/bcache/alloc.c
+index 2b46bf1..4c9852d 100644
+--- a/drivers/md/bcache/alloc.c
++++ b/drivers/md/bcache/alloc.c
+@@ -421,9 +421,11 @@ out:
+ 
+ 	if (watermark <= WATERMARK_METADATA) {
+ 		SET_GC_MARK(b, GC_MARK_METADATA);
++		SET_GC_MOVE(b, 0);
+ 		b->prio = BTREE_PRIO;
+ 	} else {
+ 		SET_GC_MARK(b, GC_MARK_RECLAIMABLE);
++		SET_GC_MOVE(b, 0);
+ 		b->prio = INITIAL_PRIO;
+ 	}
+ 
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 4beb55a..a7b1a76 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -197,7 +197,7 @@ struct bucket {
+ 	uint8_t		disk_gen;
+ 	uint8_t		last_gc; /* Most out of date gen in the btree */
+ 	uint8_t		gc_gen;
+-	uint16_t	gc_mark;
++	uint16_t	gc_mark; /* Bitfield used by GC. See below for field */
+ };
+ 
+ /*
+@@ -209,7 +209,8 @@ BITMASK(GC_MARK,	 struct bucket, gc_mark, 0, 2);
+ #define GC_MARK_RECLAIMABLE	0
+ #define GC_MARK_DIRTY		1
+ #define GC_MARK_METADATA	2
+-BITMASK(GC_SECTORS_USED, struct bucket, gc_mark, 2, 14);
++BITMASK(GC_SECTORS_USED, struct bucket, gc_mark, 2, 13);
++BITMASK(GC_MOVE, struct bucket, gc_mark, 15, 1);
+ 
+ #include "journal.h"
+ #include "stats.h"
+@@ -445,7 +446,6 @@ struct cache {
+ 	 * call prio_write() to keep gens from wrapping.
+ 	 */
+ 	uint8_t			need_save_prio;
+-	unsigned		gc_move_threshold;
+ 
+ 	/*
+ 	 * If nonzero, we know we aren't going to find any buckets to invalidate
+diff --git a/drivers/md/bcache/movinggc.c b/drivers/md/bcache/movinggc.c
+index 46c9523..30f347d 100644
+--- a/drivers/md/bcache/movinggc.c
++++ b/drivers/md/bcache/movinggc.c
+@@ -25,10 +25,9 @@ static bool moving_pred(struct keybuf *buf, struct bkey *k)
+ 	unsigned i;
+ 
+ 	for (i = 0; i < KEY_PTRS(k); i++) {
+-		struct cache *ca = PTR_CACHE(c, k, i);
+ 		struct bucket *g = PTR_BUCKET(c, k, i);
+ 
+-		if (GC_SECTORS_USED(g) < ca->gc_move_threshold)
++		if (GC_MOVE(g))
+ 			return true;
+ 	}
+ 
+@@ -227,9 +226,8 @@ void bch_moving_gc(struct cache_set *c)
+ 			sectors_to_move -= GC_SECTORS_USED(b);
+ 		}
+ 
+-		ca->gc_move_threshold = bucket_heap_top(ca);
+-
+-		pr_debug("threshold %u", ca->gc_move_threshold);
++		while (heap_pop(&ca->heap, b, bucket_cmp))
++			SET_GC_MOVE(b, 1);
+ 	}
+ 
+ 	mutex_unlock(&c->bucket_lock);
+-- 
+2.6.2
+

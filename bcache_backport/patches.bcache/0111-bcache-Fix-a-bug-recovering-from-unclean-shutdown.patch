@@ -1,0 +1,33 @@
+From 0bd143fd800055b1db756693289bbebdb93f2a73 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Tue, 4 Mar 2014 17:56:24 -0800
+Subject: [PATCH 032948/122806] bcache: Fix a bug recovering from unclean
+ shutdown
+
+The code to fixup incorrect bucket prios incorrectly did not skip btree node
+freeing keys
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 5f9c2a6..2d4a864 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -1726,9 +1726,9 @@ static int bch_btree_check_recurse(struct btree *b, struct btree_op *op,
+ 			    !ptr_stale(b->c, k, i)) {
+ 				g->gen = PTR_GEN(k, i);
+ 
+-				if (b->level)
++				if (b->level && bkey_cmp(k, &ZERO_KEY))
+ 					g->prio = BTREE_PRIO;
+-				else if (g->prio == BTREE_PRIO)
++				else if (!b->level && g->prio == BTREE_PRIO)
+ 					g->prio = INITIAL_PRIO;
+ 			}
+ 		}
+-- 
+2.6.2
+

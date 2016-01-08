@@ -1,0 +1,163 @@
+From d5cc66e95744065f96024add4bf7d7e019be54ac Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 24 Jul 2013 23:06:40 -0700
+Subject: [PATCH 009468/122806] bcache: bch_(btree|extent)_ptr_invalid()
+
+Trying to treat btree pointers and leaf node pointers the same way was a
+mistake - going to start being more explicit about the type of
+key/pointer we're dealing with. This is the first part of that
+refactoring; this patch shouldn't change any actual behaviour.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c  | 49 ++++++++++++++++++++++++++++++++++-------------
+ drivers/md/bcache/bset.h  |  4 +++-
+ drivers/md/bcache/btree.h | 13 ++++++++-----
+ drivers/md/bcache/super.c |  4 ++--
+ 4 files changed, 49 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index 6bffde4..b615348 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -73,19 +73,9 @@ void bch_keylist_pop_front(struct keylist *l)
+ 
+ /* Pointer validation */
+ 
+-bool __bch_ptr_invalid(struct cache_set *c, int level, const struct bkey *k)
++static bool __ptr_invalid(struct cache_set *c, const struct bkey *k)
+ {
+ 	unsigned i;
+-	char buf[80];
+-
+-	if (level && (!KEY_PTRS(k) || !KEY_SIZE(k) || KEY_DIRTY(k)))
+-		goto bad;
+-
+-	if (!level && KEY_SIZE(k) > KEY_OFFSET(k))
+-		goto bad;
+-
+-	if (!KEY_SIZE(k))
+-		return true;
+ 
+ 	for (i = 0; i < KEY_PTRS(k); i++)
+ 		if (ptr_available(c, k, i)) {
+@@ -96,13 +86,46 @@ bool __bch_ptr_invalid(struct cache_set *c, int level, const struct bkey *k)
+ 			if (KEY_SIZE(k) + r > c->sb.bucket_size ||
+ 			    bucket <  ca->sb.first_bucket ||
+ 			    bucket >= ca->sb.nbuckets)
+-				goto bad;
++				return true;
+ 		}
+ 
+ 	return false;
++}
++
++bool bch_btree_ptr_invalid(struct cache_set *c, const struct bkey *k)
++{
++	char buf[80];
++
++	if (!KEY_PTRS(k) || !KEY_SIZE(k) || KEY_DIRTY(k))
++		goto bad;
++
++	if (__ptr_invalid(c, k))
++		goto bad;
++
++	return false;
++bad:
++	bch_bkey_to_text(buf, sizeof(buf), k);
++	cache_bug(c, "spotted btree ptr %s: %s", buf, bch_ptr_status(c, k));
++	return true;
++}
++
++bool bch_extent_ptr_invalid(struct cache_set *c, const struct bkey *k)
++{
++	char buf[80];
++
++	if (!KEY_SIZE(k))
++		return true;
++
++	if (KEY_SIZE(k) > KEY_OFFSET(k))
++		goto bad;
++
++	if (__ptr_invalid(c, k))
++		goto bad;
++
++	return false;
+ bad:
+ 	bch_bkey_to_text(buf, sizeof(buf), k);
+-	cache_bug(c, "spotted bad key %s: %s", buf, bch_ptr_status(c, k));
++	cache_bug(c, "spotted extent %s: %s", buf, bch_ptr_status(c, k));
+ 	return true;
+ }
+ 
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index a043a92..e673860 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -277,7 +277,9 @@ static inline bool bch_cut_back(const struct bkey *where, struct bkey *k)
+ }
+ 
+ const char *bch_ptr_status(struct cache_set *, const struct bkey *);
+-bool __bch_ptr_invalid(struct cache_set *, int level, const struct bkey *);
++bool bch_btree_ptr_invalid(struct cache_set *, const struct bkey *);
++bool bch_extent_ptr_invalid(struct cache_set *, const struct bkey *);
++
+ bool bch_ptr_bad(struct btree *, const struct bkey *);
+ 
+ static inline uint8_t gen_after(uint8_t a, uint8_t b)
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index d4b705e..e11bb85 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -204,11 +204,6 @@ static inline void set_gc_sectors(struct cache_set *c)
+ 	atomic_set(&c->sectors_to_gc, c->sb.bucket_size * c->nbuckets / 8);
+ }
+ 
+-static inline bool bch_ptr_invalid(struct btree *b, const struct bkey *k)
+-{
+-	return __bch_ptr_invalid(b->c, b->level, k);
+-}
+-
+ static inline struct bkey *bch_btree_iter_init(struct btree *b,
+ 					       struct btree_iter *iter,
+ 					       struct bkey *search)
+@@ -216,6 +211,14 @@ static inline struct bkey *bch_btree_iter_init(struct btree *b,
+ 	return __bch_btree_iter_init(b, iter, search, b->sets);
+ }
+ 
++static inline bool bch_ptr_invalid(struct btree *b, const struct bkey *k)
++{
++	if (b->level)
++		return bch_btree_ptr_invalid(b->c, k);
++	else
++		return bch_extent_ptr_invalid(b->c, k);
++}
++
+ void bkey_put(struct cache_set *c, struct bkey *k);
+ 
+ /* Looping macros */
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 05f8ccb..7ab926d 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -373,7 +373,7 @@ static char *uuid_read(struct cache_set *c, struct jset *j, struct closure *cl)
+ {
+ 	struct bkey *k = &j->uuid_bucket;
+ 
+-	if (__bch_ptr_invalid(c, 1, k))
++	if (bch_btree_ptr_invalid(c, k))
+ 		return "bad uuid pointer";
+ 
+ 	bkey_copy(&c->uuid_bucket, k);
+@@ -1522,7 +1522,7 @@ static void run_cache_set(struct cache_set *c)
+ 		k = &j->btree_root;
+ 
+ 		err = "bad btree root";
+-		if (__bch_ptr_invalid(c, j->btree_level + 1, k))
++		if (bch_btree_ptr_invalid(c, k))
+ 			goto err;
+ 
+ 		err = "error reading btree root";
+-- 
+2.6.2
+

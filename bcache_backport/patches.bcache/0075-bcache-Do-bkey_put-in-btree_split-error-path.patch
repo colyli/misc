@@ -1,0 +1,45 @@
+From 5f5837d2d650db25b9153b91535e67a96b265f58 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 16 Dec 2013 16:38:49 -0800
+Subject: [PATCH 019168/122806] bcache: Do bkey_put() in btree_split() error
+ path
+
+This error path shouldn't have been hit in practice.. and we've got reworked
+reserve code coming soon so that it shouldn't _ever_ be bit... but if we've got
+code for this error path it should be correct.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 6a0f5fa..5a6b752 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -2191,18 +2191,21 @@ static int btree_split(struct btree *b, struct btree_op *op,
+ 
+ 	return 0;
+ err_free2:
++	bkey_put(b->c, &n2->key);
+ 	btree_node_free(n2);
+ 	rw_unlock(true, n2);
+ err_free1:
++	bkey_put(b->c, &n1->key);
+ 	btree_node_free(n1);
+ 	rw_unlock(true, n1);
+ err:
++	WARN(1, "bcache: btree split failed");
++
+ 	if (n3 == ERR_PTR(-EAGAIN) ||
+ 	    n2 == ERR_PTR(-EAGAIN) ||
+ 	    n1 == ERR_PTR(-EAGAIN))
+ 		return -EAGAIN;
+ 
+-	pr_warn("couldn't split");
+ 	return -ENOMEM;
+ }
+ 
+-- 
+2.6.2
+

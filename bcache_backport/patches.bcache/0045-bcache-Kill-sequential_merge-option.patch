@@ -1,0 +1,146 @@
+From 8aee122071a69ca6fa3314da7713bdf0b61dc07c Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Tue, 30 Jul 2013 22:34:40 -0700
+Subject: [PATCH 009475/122806] bcache: Kill sequential_merge option
+
+It never really made sense to expose this, so just kill it.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h  |  1 -
+ drivers/md/bcache/request.c | 43 ++++++++++++++++++-------------------------
+ drivers/md/bcache/super.c   |  1 -
+ drivers/md/bcache/sysfs.c   |  4 ----
+ 4 files changed, 18 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index d6970a6..3227355 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -364,7 +364,6 @@ struct cached_dev {
+ 	unsigned		sequential_cutoff;
+ 	unsigned		readahead;
+ 
+-	unsigned		sequential_merge:1;
+ 	unsigned		verify:1;
+ 
+ 	unsigned		partial_stripes_expensive:1;
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 932300f..f645da6 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -510,6 +510,7 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
+ 	unsigned mode = cache_mode(dc, bio);
+ 	unsigned sectors, congested = bch_get_congested(c);
+ 	struct task_struct *task = current;
++	struct io *i;
+ 
+ 	if (atomic_read(&dc->disk.detaching) ||
+ 	    c->gc_stats.in_use > CUTOFF_CACHE_ADD ||
+@@ -536,38 +537,30 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
+ 	    (bio->bi_rw & REQ_SYNC))
+ 		goto rescale;
+ 
+-	if (dc->sequential_merge) {
+-		struct io *i;
++	spin_lock(&dc->io_lock);
+ 
+-		spin_lock(&dc->io_lock);
++	hlist_for_each_entry(i, iohash(dc, bio->bi_sector), hash)
++		if (i->last == bio->bi_sector &&
++		    time_before(jiffies, i->jiffies))
++			goto found;
+ 
+-		hlist_for_each_entry(i, iohash(dc, bio->bi_sector), hash)
+-			if (i->last == bio->bi_sector &&
+-			    time_before(jiffies, i->jiffies))
+-				goto found;
++	i = list_first_entry(&dc->io_lru, struct io, lru);
+ 
+-		i = list_first_entry(&dc->io_lru, struct io, lru);
+-
+-		add_sequential(task);
+-		i->sequential = 0;
++	add_sequential(task);
++	i->sequential = 0;
+ found:
+-		if (i->sequential + bio->bi_size > i->sequential)
+-			i->sequential	+= bio->bi_size;
+-
+-		i->last			 = bio_end_sector(bio);
+-		i->jiffies		 = jiffies + msecs_to_jiffies(5000);
+-		task->sequential_io	 = i->sequential;
++	if (i->sequential + bio->bi_size > i->sequential)
++		i->sequential	+= bio->bi_size;
+ 
+-		hlist_del(&i->hash);
+-		hlist_add_head(&i->hash, iohash(dc, i->last));
+-		list_move_tail(&i->lru, &dc->io_lru);
++	i->last			 = bio_end_sector(bio);
++	i->jiffies		 = jiffies + msecs_to_jiffies(5000);
++	task->sequential_io	 = i->sequential;
+ 
+-		spin_unlock(&dc->io_lock);
+-	} else {
+-		task->sequential_io = bio->bi_size;
++	hlist_del(&i->hash);
++	hlist_add_head(&i->hash, iohash(dc, i->last));
++	list_move_tail(&i->lru, &dc->io_lru);
+ 
+-		add_sequential(task);
+-	}
++	spin_unlock(&dc->io_lock);
+ 
+ 	sectors = max(task->sequential_io,
+ 		      task->sequential_io_avg) >> 9;
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index e21200e..041dd9d 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1079,7 +1079,6 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
+ 	spin_lock_init(&dc->io_lock);
+ 	bch_cache_accounting_init(&dc->accounting, &dc->disk.cl);
+ 
+-	dc->sequential_merge		= true;
+ 	dc->sequential_cutoff		= 4 << 20;
+ 
+ 	for (io = dc->io; io < dc->io + RECENT_IO; io++) {
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index c5f73e3..4b67244 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -72,7 +72,6 @@ rw_attribute(congested_read_threshold_us);
+ rw_attribute(congested_write_threshold_us);
+ 
+ rw_attribute(sequential_cutoff);
+-rw_attribute(sequential_merge);
+ rw_attribute(data_csum);
+ rw_attribute(cache_mode);
+ rw_attribute(writeback_metadata);
+@@ -161,7 +160,6 @@ SHOW(__bch_cached_dev)
+ 	sysfs_hprint(stripe_size,	dc->disk.stripe_size << 9);
+ 	var_printf(partial_stripes_expensive,	"%u");
+ 
+-	var_printf(sequential_merge,	"%i");
+ 	var_hprint(sequential_cutoff);
+ 	var_hprint(readahead);
+ 
+@@ -207,7 +205,6 @@ STORE(__cached_dev)
+ 			    dc->writeback_rate_p_term_inverse, 1, INT_MAX);
+ 	d_strtoul(writeback_rate_d_smooth);
+ 
+-	d_strtoul(sequential_merge);
+ 	d_strtoi_h(sequential_cutoff);
+ 	d_strtoi_h(readahead);
+ 
+@@ -319,7 +316,6 @@ static struct attribute *bch_cached_dev_files[] = {
+ 	&sysfs_stripe_size,
+ 	&sysfs_partial_stripes_expensive,
+ 	&sysfs_sequential_cutoff,
+-	&sysfs_sequential_merge,
+ 	&sysfs_clear_stats,
+ 	&sysfs_running,
+ 	&sysfs_state,
+-- 
+2.6.2
+

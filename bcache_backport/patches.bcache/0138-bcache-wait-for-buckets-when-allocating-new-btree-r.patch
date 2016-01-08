@@ -1,0 +1,83 @@
+From c5aa4a3157b55bdca18dd2a9d9f43314470b6d32 Mon Sep 17 00:00:00 2001
+From: Slava Pestov <sp@daterainc.com>
+Date: Mon, 21 Apr 2014 18:23:12 -0700
+Subject: [PATCH 060626/122806] bcache: wait for buckets when allocating new
+ btree root
+
+Tested:
+- sometimes bcache_tier test would hang on startup with a failure
+  to allocate the btree root -- no longer seeing this
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c | 12 +++++++++---
+ drivers/md/bcache/btree.h |  3 ++-
+ drivers/md/bcache/super.c |  2 +-
+ 3 files changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 7347b61..9dd9f1c 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -1060,15 +1060,15 @@ static void btree_node_free(struct btree *b)
+ 	mutex_unlock(&b->c->bucket_lock);
+ }
+ 
+-struct btree *bch_btree_node_alloc(struct cache_set *c, struct btree_op *op,
+-				   int level)
++struct btree *__bch_btree_node_alloc(struct cache_set *c, struct btree_op *op,
++				     int level, bool wait)
+ {
+ 	BKEY_PADDED(key) k;
+ 	struct btree *b = ERR_PTR(-EAGAIN);
+ 
+ 	mutex_lock(&c->bucket_lock);
+ retry:
+-	if (__bch_bucket_alloc_set(c, RESERVE_BTREE, &k.key, 1, op != NULL))
++	if (__bch_bucket_alloc_set(c, RESERVE_BTREE, &k.key, 1, wait))
+ 		goto err;
+ 
+ 	bkey_put(c, &k.key);
+@@ -1100,6 +1100,12 @@ err:
+ 	return b;
+ }
+ 
++static struct btree *bch_btree_node_alloc(struct cache_set *c,
++					  struct btree_op *op, int level)
++{
++	return __bch_btree_node_alloc(c, op, level, op != NULL);
++}
++
+ static struct btree *btree_node_alloc_replacement(struct btree *b,
+ 						  struct btree_op *op)
+ {
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 91dfa5e..0044182 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -242,7 +242,8 @@ void __bch_btree_node_write(struct btree *, struct closure *);
+ void bch_btree_node_write(struct btree *, struct closure *);
+ 
+ void bch_btree_set_root(struct btree *);
+-struct btree *bch_btree_node_alloc(struct cache_set *, struct btree_op *, int);
++struct btree *__bch_btree_node_alloc(struct cache_set *, struct btree_op *,
++				     int, bool);
+ struct btree *bch_btree_node_get(struct cache_set *, struct btree_op *,
+ 				 struct bkey *, int, bool);
+ 
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 6ceaec3..3b043a0 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1669,7 +1669,7 @@ static void run_cache_set(struct cache_set *c)
+ 			goto err;
+ 
+ 		err = "cannot allocate new btree root";
+-		c->root = bch_btree_node_alloc(c, NULL, 0);
++		c->root = __bch_btree_node_alloc(c, NULL, 0, true);
+ 		if (IS_ERR_OR_NULL(c->root))
+ 			goto err;
+ 
+-- 
+2.6.2
+

@@ -1,0 +1,124 @@
+From d6fd3b11cea82346837957feab25b0be48aa424c Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 24 Jul 2013 17:20:19 -0700
+Subject: [PATCH 009438/122806] bcache: Explicitly track btree node's parent
+
+This is prep work for the reworked btree insertion code.
+
+The way we set b->parent is ugly and hacky... the problem is, when
+btree_split() or garbage collection splits or rewrites a btree node, the
+parent changes for all its (potentially already cached) children.
+
+I may change this later and add some code to look through the btree node
+cache and find all our cached child nodes and change the parent pointer
+then...
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c | 14 ++++++++++----
+ drivers/md/bcache/btree.h | 16 ++++++++++------
+ 2 files changed, 20 insertions(+), 10 deletions(-)
+
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/btree.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/btree.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/btree.c
+@@ -884,6 +884,7 @@ out:
+ 
+ 	lock_set_subclass(&b->lock.dep_map, level + 1, _THIS_IP_);
+ 	b->level	= level;
++	b->parent	= (void *) ~0UL;
+ 
+ 	mca_reinit(b);
+ 
+@@ -1898,7 +1899,7 @@ out:
+ 
+ static int btree_split(struct btree *b, struct btree_op *op)
+ {
+-	bool split, root = b == b->c->root;
++	bool split;
+ 	struct btree *n1, *n2 = NULL, *n3 = NULL;
+ 	uint64_t start_time = local_clock();
+ 
+@@ -1920,7 +1921,7 @@ static int btree_split(struct btree *b,
+ 		if (IS_ERR(n2))
+ 			goto err_free1;
+ 
+-		if (root) {
++		if (!b->parent) {
+ 			n3 = bch_btree_node_alloc(b->c, b->level + 1, &op->cl);
+ 			if (IS_ERR(n3))
+ 				goto err_free2;
+@@ -1928,7 +1929,8 @@ static int btree_split(struct btree *b,
+ 
+ 		bch_btree_insert_keys(n1, op);
+ 
+-		/* Has to be a linear search because we don't have an auxiliary
++		/*
++		 * Has to be a linear search because we don't have an auxiliary
+ 		 * search tree yet
+ 		 */
+ 
+@@ -1960,6 +1962,8 @@ static int btree_split(struct btree *b,
+ 	bch_btree_node_write(n1, &op->cl);
+ 
+ 	if (n3) {
++		/* Depth increases, make a new root */
++
+ 		bkey_copy_key(&n3->key, &MAX_KEY);
+ 		bch_btree_insert_keys(n3, op);
+ 		bch_btree_node_write(n3, &op->cl);
+@@ -1967,7 +1971,9 @@ static int btree_split(struct btree *b,
+ 		closure_sync(&op->cl);
+ 		bch_btree_set_root(n3);
+ 		rw_unlock(true, n3);
+-	} else if (root) {
++	} else if (!b->parent) {
++		/* Root filled up but didn't need to be split */
++
+ 		op->keys.top = op->keys.bottom;
+ 		closure_sync(&op->cl);
+ 		bch_btree_set_root(n1);
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/btree.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/btree.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/btree.h
+@@ -125,6 +125,7 @@ struct btree {
+ 	unsigned long		seq;
+ 	struct rw_semaphore	lock;
+ 	struct cache_set	*c;
++	struct btree		*parent;
+ 
+ 	unsigned long		flags;
+ 	uint16_t		written;	/* would be nice to kill */
+@@ -327,12 +328,13 @@ static inline void rw_unlock(bool w, str
+ ({									\
+ 	int _r, l = (b)->level - 1;					\
+ 	bool _w = l <= (op)->lock;					\
+-	struct btree *_b = bch_btree_node_get((b)->c, key, l, op);	\
+-	if (!IS_ERR(_b)) {						\
+-		_r = bch_btree_ ## fn(_b, op, ##__VA_ARGS__);		\
+-		rw_unlock(_w, _b);					\
++	struct btree *_child = bch_btree_node_get((b)->c, key, l, op);	\
++	if (!IS_ERR(_child)) {						\
++		_child->parent = (b);					\
++		_r = bch_btree_ ## fn(_child, op, ##__VA_ARGS__);	\
++		rw_unlock(_w, _child);					\
+ 	} else								\
+-		_r = PTR_ERR(_b);					\
++		_r = PTR_ERR(_child);					\
+ 	_r;								\
+ })
+ 
+@@ -350,8 +352,10 @@ static inline void rw_unlock(bool w, str
+ 		bool _w = insert_lock(op, _b);				\
+ 		rw_lock(_w, _b, _b->level);				\
+ 		if (_b == (c)->root &&					\
+-		    _w == insert_lock(op, _b))				\
++		    _w == insert_lock(op, _b)) {			\
++			_b->parent = NULL;				\
+ 			_r = bch_btree_ ## fn(_b, op, ##__VA_ARGS__);	\
++		}							\
+ 		rw_unlock(_w, _b);					\
+ 		bch_cannibalize_unlock(c, &(op)->cl);			\
+ 	} while (_r == -EINTR);						\

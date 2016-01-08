@@ -1,0 +1,47 @@
+From 913dc33fb2720fb5f979011664294137ddd8b13b Mon Sep 17 00:00:00 2001
+From: Slava Pestov <sp@daterainc.com>
+Date: Fri, 23 May 2014 11:18:35 -0700
+Subject: [PATCH 060632/122806] bcache: fix crash in
+ bcache_btree_node_alloc_fail tracepoint
+
+'b' was NULL.
+
+Change-Id: Icac0fd04afa2d23f213d96d51afd53374e6dd0c0
+---
+ drivers/md/bcache/btree.c     | 2 +-
+ include/trace/events/bcache.h | 6 +++---
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 39c7f5b..f823785 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -1096,7 +1096,7 @@ err_free:
+ err:
+ 	mutex_unlock(&c->bucket_lock);
+ 
+-	trace_bcache_btree_node_alloc_fail(b);
++	trace_bcache_btree_node_alloc_fail(c);
+ 	return b;
+ }
+ 
+diff --git a/include/trace/events/bcache.h b/include/trace/events/bcache.h
+index 6778e41..981acf7 100644
+--- a/include/trace/events/bcache.h
++++ b/include/trace/events/bcache.h
+@@ -261,9 +261,9 @@ DEFINE_EVENT(btree_node, bcache_btree_node_alloc,
+ 	TP_ARGS(b)
+ );
+ 
+-DEFINE_EVENT(btree_node, bcache_btree_node_alloc_fail,
+-	TP_PROTO(struct btree *b),
+-	TP_ARGS(b)
++DEFINE_EVENT(cache_set, bcache_btree_node_alloc_fail,
++	TP_PROTO(struct cache_set *c),
++	TP_ARGS(c)
+ );
+ 
+ DEFINE_EVENT(btree_node, bcache_btree_node_free,
+-- 
+2.6.2
+

@@ -1,0 +1,143 @@
+From 4f3d40147b8d0ce7055e241e1d263e0aa2b2b46d Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Tue, 10 Sep 2013 18:46:36 -0700
+Subject: [PATCH 009442/122806] bcache: Add explicit keylist arg to
+ btree_insert()
+
+Some refactoring - better to explicitly pass stuff around instead of
+having it all in the "big bag of state", struct btree_op. Going to prune
+struct btree_op quite a bit over time.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c     | 26 ++++++++++++++------------
+ drivers/md/bcache/btree.h     |  2 +-
+ drivers/md/bcache/journal.c   |  2 +-
+ drivers/md/bcache/request.c   |  2 +-
+ drivers/md/bcache/writeback.c |  2 +-
+ 5 files changed, 18 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 08a8532..fc3cae5 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -2109,30 +2109,32 @@ out:
+ 	return ret;
+ }
+ 
+-static int bch_btree_insert_recurse(struct btree *b, struct btree_op *op)
++static int bch_btree_insert_recurse(struct btree *b, struct btree_op *op,
++				    struct keylist *keys)
+ {
+-	if (bch_keylist_empty(&op->keys))
++	if (bch_keylist_empty(keys))
+ 		return 0;
+ 
+ 	if (b->level) {
+-		struct bkey *insert = op->keys.bottom;
+-		struct bkey *k = bch_next_recurse_key(b, &START_KEY(insert));
++		struct bkey *k;
+ 
++		k = bch_next_recurse_key(b, &START_KEY(keys->bottom));
+ 		if (!k) {
+ 			btree_bug(b, "no key to recurse on at level %i/%i",
+ 				  b->level, b->c->root->level);
+ 
+-			op->keys.top = op->keys.bottom;
++			keys->top = keys->bottom;
+ 			return -EIO;
+ 		}
+ 
+-		return btree(insert_recurse, k, b, op);
++		return btree(insert_recurse, k, b, op, keys);
+ 	} else {
+-		return bch_btree_insert_node(b, op, &op->keys);
++		return bch_btree_insert_node(b, op, keys);
+ 	}
+ }
+ 
+-int bch_btree_insert(struct btree_op *op, struct cache_set *c)
++int bch_btree_insert(struct btree_op *op, struct cache_set *c,
++		     struct keylist *keys)
+ {
+ 	int ret = 0;
+ 
+@@ -2142,11 +2144,11 @@ int bch_btree_insert(struct btree_op *op, struct cache_set *c)
+ 	 */
+ 	clear_closure_blocking(&op->cl);
+ 
+-	BUG_ON(bch_keylist_empty(&op->keys));
++	BUG_ON(bch_keylist_empty(keys));
+ 
+-	while (!bch_keylist_empty(&op->keys)) {
++	while (!bch_keylist_empty(keys)) {
+ 		op->lock = 0;
+-		ret = btree_root(insert_recurse, c, op);
++		ret = btree_root(insert_recurse, c, op, keys);
+ 
+ 		if (ret == -EAGAIN) {
+ 			ret = 0;
+@@ -2157,7 +2159,7 @@ int bch_btree_insert(struct btree_op *op, struct cache_set *c)
+ 			pr_err("error %i trying to insert key for %s",
+ 			       ret, op_type(op));
+ 
+-			while ((k = bch_keylist_pop(&op->keys)))
++			while ((k = bch_keylist_pop(keys)))
+ 				bkey_put(c, k, 0);
+ 		}
+ 	}
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 73bd621..967aacd 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -384,7 +384,7 @@ struct btree *bch_btree_node_get(struct cache_set *, struct bkey *,
+ 
+ int bch_btree_insert_check_key(struct btree *, struct btree_op *,
+ 			       struct bkey *);
+-int bch_btree_insert(struct btree_op *, struct cache_set *);
++int bch_btree_insert(struct btree_op *, struct cache_set *, struct keylist *);
+ 
+ int bch_btree_search_recurse(struct btree *, struct btree_op *);
+ 
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 9e87758..5abe5d5 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -320,7 +320,7 @@ int bch_journal_replay(struct cache_set *s, struct list_head *list,
+ 			op->journal = i->pin;
+ 			atomic_inc(op->journal);
+ 
+-			ret = bch_btree_insert(op, s);
++			ret = bch_btree_insert(op, s, &op->keys);
+ 			if (ret)
+ 				goto err;
+ 
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 9ed334c..7fd84ce9 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -607,7 +607,7 @@ void bch_btree_insert_async(struct closure *cl)
+ 	struct btree_op *op = container_of(cl, struct btree_op, cl);
+ 	struct search *s = container_of(op, struct search, op);
+ 
+-	if (bch_btree_insert(op, op->c)) {
++	if (bch_btree_insert(op, op->c, &op->keys)) {
+ 		s->error		= -ENOMEM;
+ 		op->insert_data_done	= true;
+ 	}
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index b842fbf..8ffc8ec 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -311,7 +311,7 @@ static void write_dirty_finish(struct closure *cl)
+ 		for (i = 0; i < KEY_PTRS(&w->key); i++)
+ 			atomic_inc(&PTR_BUCKET(dc->disk.c, &w->key, i)->pin);
+ 
+-		bch_btree_insert(&op, dc->disk.c);
++		bch_btree_insert(&op, dc->disk.c, &op.keys);
+ 		closure_sync(&op.cl);
+ 
+ 		if (op.insert_collision)
+-- 
+2.6.2
+

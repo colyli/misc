@@ -1,0 +1,102 @@
+From 56b30770b27d54d68ad51eccc6d888282b568cee Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 23 Jan 2014 01:44:55 -0800
+Subject: [PATCH 032962/122806] bcache: Kill btree_io_wq
+
+With the locking rework in the last patch, this shouldn't be needed anymore -
+btree_node_write_work() only takes b->write_lock which is never held for very
+long.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h |  2 --
+ drivers/md/bcache/btree.c  | 22 ++--------------------
+ drivers/md/bcache/super.c  |  2 --
+ 3 files changed, 2 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 014236e..15d2623 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -962,7 +962,5 @@ void bch_debug_exit(void);
+ int bch_debug_init(struct kobject *);
+ void bch_request_exit(void);
+ int bch_request_init(void);
+-void bch_btree_exit(void);
+-int bch_btree_init(void);
+ 
+ #endif /* _BCACHE_H */
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 01b1b7e..beb3255 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -93,8 +93,6 @@
+ #define PTR_HASH(c, k)							\
+ 	(((k)->ptr[0] >> c->bucket_bits) | PTR_GEN(k, 0))
+ 
+-static struct workqueue_struct *btree_io_wq;
+-
+ #define insert_lock(s, b)	((b)->level <= (s)->lock)
+ 
+ /*
+@@ -362,8 +360,7 @@ static void __btree_node_write_done(struct closure *cl)
+ 	btree_complete_write(b, w);
+ 
+ 	if (btree_node_dirty(b))
+-		queue_delayed_work(btree_io_wq, &b->work,
+-				   msecs_to_jiffies(30000));
++		schedule_delayed_work(&b->work, 30 * HZ);
+ 
+ 	closure_return_with_destructor(cl, btree_node_write_unlock);
+ }
+@@ -535,7 +532,7 @@ static void bch_btree_leaf_dirty(struct btree *b, atomic_t *journal_ref)
+ 	BUG_ON(!i->keys);
+ 
+ 	if (!btree_node_dirty(b))
+-		queue_delayed_work(btree_io_wq, &b->work, 30 * HZ);
++		schedule_delayed_work(&b->work, 30 * HZ);
+ 
+ 	set_btree_node_dirty(b);
+ 
+@@ -2446,18 +2443,3 @@ void bch_keybuf_init(struct keybuf *buf)
+ 	spin_lock_init(&buf->lock);
+ 	array_allocator_init(&buf->freelist);
+ }
+-
+-void bch_btree_exit(void)
+-{
+-	if (btree_io_wq)
+-		destroy_workqueue(btree_io_wq);
+-}
+-
+-int __init bch_btree_init(void)
+-{
+-	btree_io_wq = create_singlethread_workqueue("bch_btree_io");
+-	if (!btree_io_wq)
+-		return -ENOMEM;
+-
+-	return 0;
+-}
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 9ded064..307fe37 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -2072,7 +2072,6 @@ static void bcache_exit(void)
+ {
+ 	bch_debug_exit();
+ 	bch_request_exit();
+-	bch_btree_exit();
+ 	if (bcache_kobj)
+ 		kobject_put(bcache_kobj);
+ 	if (bcache_wq)
+@@ -2102,7 +2101,6 @@ static int __init bcache_init(void)
+ 	if (!(bcache_wq = create_workqueue("bcache")) ||
+ 	    !(bcache_kobj = kobject_create_and_add("bcache", fs_kobj)) ||
+ 	    sysfs_create_files(bcache_kobj, files) ||
+-	    bch_btree_init() ||
+ 	    bch_request_init() ||
+ 	    bch_debug_init(bcache_kobj))
+ 		goto err;
+-- 
+2.6.2
+

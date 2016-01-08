@@ -1,0 +1,270 @@
+From 16749c23c00c686ed168471963e3ddb0f3fcd855 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 11 Nov 2013 13:58:34 -0800
+Subject: [PATCH 015436/122806] bcache: New writeback PD controller
+
+The old writeback PD controller could get into states where it had throttled all
+the way down and take way too long to recover - it was too complicated to really
+understand what it was doing.
+
+This rewrites a good chunk of it to hopefully be simpler and make more sense,
+and it also pays more attention to units which should make the behaviour a bit
+easier to understand.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h    |  6 +++---
+ drivers/md/bcache/sysfs.c     | 50 +++++++++++++++++++++++++------------------
+ drivers/md/bcache/util.c      |  8 ++++++-
+ drivers/md/bcache/writeback.c | 47 ++++++++++++++++++++--------------------
+ 4 files changed, 62 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index a7b1a76..754f4317 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -373,14 +373,14 @@ struct cached_dev {
+ 	unsigned char		writeback_percent;
+ 	unsigned		writeback_delay;
+ 
+-	int			writeback_rate_change;
+-	int64_t			writeback_rate_derivative;
+ 	uint64_t		writeback_rate_target;
++	int64_t			writeback_rate_proportional;
++	int64_t			writeback_rate_derivative;
++	int64_t			writeback_rate_change;
+ 
+ 	unsigned		writeback_rate_update_seconds;
+ 	unsigned		writeback_rate_d_term;
+ 	unsigned		writeback_rate_p_term_inverse;
+-	unsigned		writeback_rate_d_smooth;
+ };
+ 
+ enum alloc_watermarks {
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index 80d4c2b..a1f8561 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -83,7 +83,6 @@ rw_attribute(writeback_rate);
+ rw_attribute(writeback_rate_update_seconds);
+ rw_attribute(writeback_rate_d_term);
+ rw_attribute(writeback_rate_p_term_inverse);
+-rw_attribute(writeback_rate_d_smooth);
+ read_attribute(writeback_rate_debug);
+ 
+ read_attribute(stripe_size);
+@@ -129,31 +128,41 @@ SHOW(__bch_cached_dev)
+ 	var_printf(writeback_running,	"%i");
+ 	var_print(writeback_delay);
+ 	var_print(writeback_percent);
+-	sysfs_print(writeback_rate,	dc->writeback_rate.rate);
++	sysfs_hprint(writeback_rate,	dc->writeback_rate.rate << 9);
+ 
+ 	var_print(writeback_rate_update_seconds);
+ 	var_print(writeback_rate_d_term);
+ 	var_print(writeback_rate_p_term_inverse);
+-	var_print(writeback_rate_d_smooth);
+ 
+ 	if (attr == &sysfs_writeback_rate_debug) {
++		char rate[20];
+ 		char dirty[20];
+-		char derivative[20];
+ 		char target[20];
+-		bch_hprint(dirty,
+-			   bcache_dev_sectors_dirty(&dc->disk) << 9);
+-		bch_hprint(derivative,	dc->writeback_rate_derivative << 9);
++		char proportional[20];
++		char derivative[20];
++		char change[20];
++		s64 next_io;
++
++		bch_hprint(rate,	dc->writeback_rate.rate << 9);
++		bch_hprint(dirty,	bcache_dev_sectors_dirty(&dc->disk) << 9);
+ 		bch_hprint(target,	dc->writeback_rate_target << 9);
++		bch_hprint(proportional,dc->writeback_rate_proportional << 9);
++		bch_hprint(derivative,	dc->writeback_rate_derivative << 9);
++		bch_hprint(change,	dc->writeback_rate_change << 9);
++
++		next_io = div64_s64(dc->writeback_rate.next - local_clock(),
++				    NSEC_PER_MSEC);
+ 
+ 		return sprintf(buf,
+-			       "rate:\t\t%u\n"
+-			       "change:\t\t%i\n"
++			       "rate:\t\t%s/sec\n"
+ 			       "dirty:\t\t%s\n"
++			       "target:\t\t%s\n"
++			       "proportional:\t%s\n"
+ 			       "derivative:\t%s\n"
+-			       "target:\t\t%s\n",
+-			       dc->writeback_rate.rate,
+-			       dc->writeback_rate_change,
+-			       dirty, derivative, target);
++			       "change:\t\t%s/sec\n"
++			       "next io:\t%llims\n",
++			       rate, dirty, target, proportional,
++			       derivative, change, next_io);
+ 	}
+ 
+ 	sysfs_hprint(dirty_data,
+@@ -189,6 +198,7 @@ STORE(__cached_dev)
+ 	struct kobj_uevent_env *env;
+ 
+ #define d_strtoul(var)		sysfs_strtoul(var, dc->var)
++#define d_strtoul_nonzero(var)	sysfs_strtoul_clamp(var, dc->var, 1, INT_MAX)
+ #define d_strtoi_h(var)		sysfs_hatoi(var, dc->var)
+ 
+ 	sysfs_strtoul(data_csum,	dc->disk.data_csum);
+@@ -197,16 +207,15 @@ STORE(__cached_dev)
+ 	d_strtoul(writeback_metadata);
+ 	d_strtoul(writeback_running);
+ 	d_strtoul(writeback_delay);
+-	sysfs_strtoul_clamp(writeback_rate,
+-			    dc->writeback_rate.rate, 1, 1000000);
++
+ 	sysfs_strtoul_clamp(writeback_percent, dc->writeback_percent, 0, 40);
+ 
+-	d_strtoul(writeback_rate_update_seconds);
++	sysfs_strtoul_clamp(writeback_rate,
++			    dc->writeback_rate.rate, 1, INT_MAX);
++
++	d_strtoul_nonzero(writeback_rate_update_seconds);
+ 	d_strtoul(writeback_rate_d_term);
+-	d_strtoul(writeback_rate_p_term_inverse);
+-	sysfs_strtoul_clamp(writeback_rate_p_term_inverse,
+-			    dc->writeback_rate_p_term_inverse, 1, INT_MAX);
+-	d_strtoul(writeback_rate_d_smooth);
++	d_strtoul_nonzero(writeback_rate_p_term_inverse);
+ 
+ 	d_strtoi_h(sequential_cutoff);
+ 	d_strtoi_h(readahead);
+@@ -313,7 +322,6 @@ static struct attribute *bch_cached_dev_files[] = {
+ 	&sysfs_writeback_rate_update_seconds,
+ 	&sysfs_writeback_rate_d_term,
+ 	&sysfs_writeback_rate_p_term_inverse,
+-	&sysfs_writeback_rate_d_smooth,
+ 	&sysfs_writeback_rate_debug,
+ 	&sysfs_dirty_data,
+ 	&sysfs_stripe_size,
+diff --git a/drivers/md/bcache/util.c b/drivers/md/bcache/util.c
+index 462214e..bb37618 100644
+--- a/drivers/md/bcache/util.c
++++ b/drivers/md/bcache/util.c
+@@ -209,7 +209,13 @@ uint64_t bch_next_delay(struct bch_ratelimit *d, uint64_t done)
+ {
+ 	uint64_t now = local_clock();
+ 
+-	d->next += div_u64(done, d->rate);
++	d->next += div_u64(done * NSEC_PER_SEC, d->rate);
++
++	if (time_before64(now + NSEC_PER_SEC, d->next))
++		d->next = now + NSEC_PER_SEC;
++
++	if (time_after64(now - NSEC_PER_SEC * 2, d->next))
++		d->next = now - NSEC_PER_SEC * 2;
+ 
+ 	return time_after64(d->next, now)
+ 		? div_u64(d->next - now, NSEC_PER_SEC / HZ)
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index 3cd931d..6c44fe0 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -30,38 +30,40 @@ static void __update_writeback_rate(struct cached_dev *dc)
+ 
+ 	/* PD controller */
+ 
+-	int change = 0;
+-	int64_t error;
+ 	int64_t dirty = bcache_dev_sectors_dirty(&dc->disk);
+ 	int64_t derivative = dirty - dc->disk.sectors_dirty_last;
++	int64_t proportional = dirty - target;
++	int64_t change;
+ 
+ 	dc->disk.sectors_dirty_last = dirty;
+ 
+-	derivative *= dc->writeback_rate_d_term;
+-	derivative = clamp(derivative, -dirty, dirty);
++	/* Scale to sectors per second */
+ 
+-	derivative = ewma_add(dc->disk.sectors_dirty_derivative, derivative,
+-			      dc->writeback_rate_d_smooth, 0);
++	proportional *= dc->writeback_rate_update_seconds;
++	proportional = div_s64(proportional, dc->writeback_rate_p_term_inverse);
+ 
+-	/* Avoid divide by zero */
+-	if (!target)
+-		goto out;
++	derivative = div_s64(derivative, dc->writeback_rate_update_seconds);
+ 
+-	error = div64_s64((dirty + derivative - target) << 8, target);
++	derivative = ewma_add(dc->disk.sectors_dirty_derivative, derivative,
++			      (dc->writeback_rate_d_term /
++			       dc->writeback_rate_update_seconds) ?: 1, 0);
++
++	derivative *= dc->writeback_rate_d_term;
++	derivative = div_s64(derivative, dc->writeback_rate_p_term_inverse);
+ 
+-	change = div_s64((dc->writeback_rate.rate * error) >> 8,
+-			 dc->writeback_rate_p_term_inverse);
++	change = proportional + derivative;
+ 
+ 	/* Don't increase writeback rate if the device isn't keeping up */
+ 	if (change > 0 &&
+ 	    time_after64(local_clock(),
+-			 dc->writeback_rate.next + 10 * NSEC_PER_MSEC))
++			 dc->writeback_rate.next + NSEC_PER_MSEC))
+ 		change = 0;
+ 
+ 	dc->writeback_rate.rate =
+-		clamp_t(int64_t, dc->writeback_rate.rate + change,
++		clamp_t(int64_t, (int64_t) dc->writeback_rate.rate + change,
+ 			1, NSEC_PER_MSEC);
+-out:
++
++	dc->writeback_rate_proportional = proportional;
+ 	dc->writeback_rate_derivative = derivative;
+ 	dc->writeback_rate_change = change;
+ 	dc->writeback_rate_target = target;
+@@ -87,15 +89,11 @@ static void update_writeback_rate(struct work_struct *work)
+ 
+ static unsigned writeback_delay(struct cached_dev *dc, unsigned sectors)
+ {
+-	uint64_t ret;
+-
+ 	if (test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) ||
+ 	    !dc->writeback_percent)
+ 		return 0;
+ 
+-	ret = bch_next_delay(&dc->writeback_rate, sectors * 10000000ULL);
+-
+-	return min_t(uint64_t, ret, HZ);
++	return bch_next_delay(&dc->writeback_rate, sectors);
+ }
+ 
+ struct dirty_io {
+@@ -476,6 +474,8 @@ void bch_sectors_dirty_init(struct cached_dev *dc)
+ 
+ 	bch_btree_map_keys(&op.op, dc->disk.c, &KEY(op.inode, 0, 0),
+ 			   sectors_dirty_init_fn, 0);
++
++	dc->disk.sectors_dirty_last = bcache_dev_sectors_dirty(&dc->disk);
+ }
+ 
+ int bch_cached_dev_writeback_init(struct cached_dev *dc)
+@@ -490,10 +490,9 @@ int bch_cached_dev_writeback_init(struct cached_dev *dc)
+ 	dc->writeback_delay		= 30;
+ 	dc->writeback_rate.rate		= 1024;
+ 
+-	dc->writeback_rate_update_seconds = 30;
+-	dc->writeback_rate_d_term	= 16;
+-	dc->writeback_rate_p_term_inverse = 64;
+-	dc->writeback_rate_d_smooth	= 8;
++	dc->writeback_rate_update_seconds = 5;
++	dc->writeback_rate_d_term	= 30;
++	dc->writeback_rate_p_term_inverse = 6000;
+ 
+ 	dc->writeback_thread = kthread_create(bch_writeback_thread, dc,
+ 					      "bcache_writeback");
+-- 
+2.6.2
+

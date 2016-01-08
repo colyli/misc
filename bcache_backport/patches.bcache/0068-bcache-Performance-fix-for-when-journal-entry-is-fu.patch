@@ -1,0 +1,67 @@
+From 5775e2133dfa0dc1f4c7f233e2144d32cb516f54 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Tue, 10 Dec 2013 16:10:46 -0800
+Subject: [PATCH 019161/122806] bcache: Performance fix for when journal entry
+ is full
+
+We were unnecessarily waiting on a journal write to complete when we just needed
+to start a journal write and start setting up the next one.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/journal.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 29cccc5..ad68728 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -673,6 +673,7 @@ static struct journal_write *journal_wait_for_write(struct cache_set *c,
+ {
+ 	size_t sectors;
+ 	struct closure cl;
++	bool wait = false;
+ 
+ 	closure_init_stack(&cl);
+ 
+@@ -689,9 +690,12 @@ static struct journal_write *journal_wait_for_write(struct cache_set *c,
+ 				     PAGE_SECTORS << JSET_BITS))
+ 			return w;
+ 
+-		/* XXX: tracepoint */
++		if (wait)
++			closure_wait(&c->journal.wait, &cl);
++
+ 		if (!journal_full(&c->journal)) {
+-			trace_bcache_journal_entry_full(c);
++			if (wait)
++				trace_bcache_journal_entry_full(c);
+ 
+ 			/*
+ 			 * XXX: If we were inserting so many keys that they
+@@ -701,12 +705,11 @@ static struct journal_write *journal_wait_for_write(struct cache_set *c,
+ 			 */
+ 			BUG_ON(!w->data->keys);
+ 
+-			closure_wait(&w->wait, &cl);
+ 			journal_try_write(c); /* unlocks */
+ 		} else {
+-			trace_bcache_journal_full(c);
++			if (wait)
++				trace_bcache_journal_full(c);
+ 
+-			closure_wait(&c->journal.wait, &cl);
+ 			journal_reclaim(c);
+ 			spin_unlock(&c->journal.lock);
+ 
+@@ -715,6 +718,7 @@ static struct journal_write *journal_wait_for_write(struct cache_set *c,
+ 
+ 		closure_sync(&cl);
+ 		spin_lock(&c->journal.lock);
++		wait = true;
+ 	}
+ }
+ 
+-- 
+2.6.2
+

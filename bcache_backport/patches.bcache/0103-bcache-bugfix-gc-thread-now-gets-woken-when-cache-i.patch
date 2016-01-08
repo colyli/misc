@@ -1,0 +1,36 @@
+From e3b4825b85eab879b618af6ea18529ca7ab9a64f Mon Sep 17 00:00:00 2001
+From: Nicholas Swenson <nks@daterainc.com>
+Date: Thu, 12 Dec 2013 12:53:28 -0800
+Subject: [PATCH 022877/122806] bcache: bugfix - gc thread now gets woken when
+ cache is full
+
+Signed-off-by: Nicholas Swenson <nks@daterainc.com>
+---
+ drivers/md/bcache/request.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index fcdb59f..675229b 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -354,14 +354,14 @@ static void bch_data_insert_start(struct closure *cl)
+ 	struct data_insert_op *op = container_of(cl, struct data_insert_op, cl);
+ 	struct bio *bio = op->bio, *n;
+ 
+-	if (op->bypass)
+-		return bch_data_invalidate(cl);
+-
+ 	if (atomic_sub_return(bio_sectors(bio), &op->c->sectors_to_gc) < 0) {
+ 		set_gc_sectors(op->c);
+ 		wake_up_gc(op->c);
+ 	}
+ 
++	if (op->bypass)
++		return bch_data_invalidate(cl);
++
+ 	/*
+ 	 * Journal writes are marked REQ_FLUSH; if the original write was a
+ 	 * flush, it'll wait on the journal write.
+-- 
+2.6.2
+

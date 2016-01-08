@@ -1,0 +1,376 @@
+From 35fcd848d72683141052aa9880542461577f2dbe Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 24 Jul 2013 17:29:09 -0700
+Subject: [PATCH 009449/122806] bcache: Convert bucket_wait to
+ wait_queue_head_t
+
+At one point we did do fancy asynchronous waiting stuff with
+bucket_wait, but that's all gone (and bucket_wait is used a lot less
+than it used to be). So use the standard primitives.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/alloc.c   | 82 ++++++++++++++++++++++++++-------------------
+ drivers/md/bcache/bcache.h  |  8 ++---
+ drivers/md/bcache/btree.c   | 25 ++++++--------
+ drivers/md/bcache/btree.h   |  6 ++--
+ drivers/md/bcache/request.c |  9 ++---
+ drivers/md/bcache/super.c   |  7 ++--
+ 6 files changed, 70 insertions(+), 67 deletions(-)
+
+diff --git a/drivers/md/bcache/alloc.c b/drivers/md/bcache/alloc.c
+index e033b02..1b64e66 100644
+--- a/drivers/md/bcache/alloc.c
++++ b/drivers/md/bcache/alloc.c
+@@ -339,7 +339,7 @@ static int bch_allocator_thread(void *arg)
+ 			allocator_wait(ca, !fifo_full(&ca->free));
+ 
+ 			fifo_push(&ca->free, bucket);
+-			closure_wake_up(&ca->set->bucket_wait);
++			wake_up(&ca->set->bucket_wait);
+ 		}
+ 
+ 		/*
+@@ -365,16 +365,41 @@ static int bch_allocator_thread(void *arg)
+ 	}
+ }
+ 
+-long bch_bucket_alloc(struct cache *ca, unsigned watermark, struct closure *cl)
++long bch_bucket_alloc(struct cache *ca, unsigned watermark, bool wait)
+ {
+-	long r = -1;
+-again:
++	DEFINE_WAIT(w);
++	struct bucket *b;
++	long r;
++
++	/* fastpath */
++	if (fifo_used(&ca->free) > ca->watermark[watermark]) {
++		fifo_pop(&ca->free, r);
++		goto out;
++	}
++
++	if (!wait)
++		return -1;
++
++	while (1) {
++		if (fifo_used(&ca->free) > ca->watermark[watermark]) {
++			fifo_pop(&ca->free, r);
++			break;
++		}
++
++		prepare_to_wait(&ca->set->bucket_wait, &w,
++				TASK_UNINTERRUPTIBLE);
++
++		mutex_unlock(&ca->set->bucket_lock);
++		schedule();
++		mutex_lock(&ca->set->bucket_lock);
++	}
++
++	finish_wait(&ca->set->bucket_wait, &w);
++out:
+ 	wake_up_process(ca->alloc_thread);
+ 
+-	if (fifo_used(&ca->free) > ca->watermark[watermark] &&
+-	    fifo_pop(&ca->free, r)) {
+-		struct bucket *b = ca->buckets + r;
+ #ifdef CONFIG_BCACHE_EDEBUG
++	{
+ 		size_t iter;
+ 		long i;
+ 
+@@ -387,36 +412,23 @@ again:
+ 			BUG_ON(i == r);
+ 		fifo_for_each(i, &ca->unused, iter)
+ 			BUG_ON(i == r);
+-#endif
+-		BUG_ON(atomic_read(&b->pin) != 1);
+-
+-		SET_GC_SECTORS_USED(b, ca->sb.bucket_size);
+-
+-		if (watermark <= WATERMARK_METADATA) {
+-			SET_GC_MARK(b, GC_MARK_METADATA);
+-			b->prio = BTREE_PRIO;
+-		} else {
+-			SET_GC_MARK(b, GC_MARK_RECLAIMABLE);
+-			b->prio = INITIAL_PRIO;
+-		}
+-
+-		return r;
+ 	}
++#endif
++	b = ca->buckets + r;
+ 
+-	trace_bcache_alloc_fail(ca);
++	BUG_ON(atomic_read(&b->pin) != 1);
+ 
+-	if (cl) {
+-		closure_wait(&ca->set->bucket_wait, cl);
++	SET_GC_SECTORS_USED(b, ca->sb.bucket_size);
+ 
+-		if (closure_blocking(cl)) {
+-			mutex_unlock(&ca->set->bucket_lock);
+-			closure_sync(cl);
+-			mutex_lock(&ca->set->bucket_lock);
+-			goto again;
+-		}
++	if (watermark <= WATERMARK_METADATA) {
++		SET_GC_MARK(b, GC_MARK_METADATA);
++		b->prio = BTREE_PRIO;
++	} else {
++		SET_GC_MARK(b, GC_MARK_RECLAIMABLE);
++		b->prio = INITIAL_PRIO;
+ 	}
+ 
+-	return -1;
++	return r;
+ }
+ 
+ void bch_bucket_free(struct cache_set *c, struct bkey *k)
+@@ -433,7 +445,7 @@ void bch_bucket_free(struct cache_set *c, struct bkey *k)
+ }
+ 
+ int __bch_bucket_alloc_set(struct cache_set *c, unsigned watermark,
+-			   struct bkey *k, int n, struct closure *cl)
++			   struct bkey *k, int n, bool wait)
+ {
+ 	int i;
+ 
+@@ -446,7 +458,7 @@ int __bch_bucket_alloc_set(struct cache_set *c, unsigned watermark,
+ 
+ 	for (i = 0; i < n; i++) {
+ 		struct cache *ca = c->cache_by_alloc[i];
+-		long b = bch_bucket_alloc(ca, watermark, cl);
++		long b = bch_bucket_alloc(ca, watermark, wait);
+ 
+ 		if (b == -1)
+ 			goto err;
+@@ -466,11 +478,11 @@ err:
+ }
+ 
+ int bch_bucket_alloc_set(struct cache_set *c, unsigned watermark,
+-			 struct bkey *k, int n, struct closure *cl)
++			 struct bkey *k, int n, bool wait)
+ {
+ 	int ret;
+ 	mutex_lock(&c->bucket_lock);
+-	ret = __bch_bucket_alloc_set(c, watermark, k, n, cl);
++	ret = __bch_bucket_alloc_set(c, watermark, k, n, wait);
+ 	mutex_unlock(&c->bucket_lock);
+ 	return ret;
+ }
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index c1c4419..d352074 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -750,7 +750,7 @@ struct cache_set {
+ 	 * written.
+ 	 */
+ 	atomic_t		prio_blocked;
+-	struct closure_waitlist	bucket_wait;
++	wait_queue_head_t	bucket_wait;
+ 
+ 	/*
+ 	 * For any bio we don't skip we subtract the number of sectors from
+@@ -1162,13 +1162,13 @@ uint8_t bch_inc_gen(struct cache *, struct bucket *);
+ void bch_rescale_priorities(struct cache_set *, int);
+ bool bch_bucket_add_unused(struct cache *, struct bucket *);
+ 
+-long bch_bucket_alloc(struct cache *, unsigned, struct closure *);
++long bch_bucket_alloc(struct cache *, unsigned, bool);
+ void bch_bucket_free(struct cache_set *, struct bkey *);
+ 
+ int __bch_bucket_alloc_set(struct cache_set *, unsigned,
+-			   struct bkey *, int, struct closure *);
++			   struct bkey *, int, bool);
+ int bch_bucket_alloc_set(struct cache_set *, unsigned,
+-			 struct bkey *, int, struct closure *);
++			 struct bkey *, int, bool);
+ 
+ __printf(2, 3)
+ bool bch_cache_set_error(struct cache_set *, const char *, ...);
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 4d50f1e..935d90d 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -813,7 +813,7 @@ static struct btree *mca_cannibalize(struct cache_set *c, struct bkey *k)
+  * cannibalize_bucket() will take. This means every time we unlock the root of
+  * the btree, we need to release this lock if we have it held.
+  */
+-void bch_cannibalize_unlock(struct cache_set *c, struct closure *cl)
++void bch_cannibalize_unlock(struct cache_set *c)
+ {
+ 	if (c->try_harder == current) {
+ 		bch_time_stats_update(&c->try_harder_time, c->try_harder_start);
+@@ -995,15 +995,14 @@ static void btree_node_free(struct btree *b)
+ 	mutex_unlock(&b->c->bucket_lock);
+ }
+ 
+-struct btree *bch_btree_node_alloc(struct cache_set *c, int level,
+-				   struct closure *cl)
++struct btree *bch_btree_node_alloc(struct cache_set *c, int level)
+ {
+ 	BKEY_PADDED(key) k;
+ 	struct btree *b = ERR_PTR(-EAGAIN);
+ 
+ 	mutex_lock(&c->bucket_lock);
+ retry:
+-	if (__bch_bucket_alloc_set(c, WATERMARK_METADATA, &k.key, 1, cl))
++	if (__bch_bucket_alloc_set(c, WATERMARK_METADATA, &k.key, 1, true))
+ 		goto err;
+ 
+ 	SET_KEY_SIZE(&k.key, c->btree_pages * PAGE_SECTORS);
+@@ -1036,10 +1035,9 @@ err:
+ 	return b;
+ }
+ 
+-static struct btree *btree_node_alloc_replacement(struct btree *b,
+-						  struct closure *cl)
++static struct btree *btree_node_alloc_replacement(struct btree *b)
+ {
+-	struct btree *n = bch_btree_node_alloc(b->c, b->level, cl);
++	struct btree *n = bch_btree_node_alloc(b->c, b->level);
+ 	if (!IS_ERR_OR_NULL(n))
+ 		bch_btree_sort_into(b, n);
+ 
+@@ -1152,7 +1150,7 @@ static struct btree *btree_gc_alloc(struct btree *b, struct bkey *k)
+ 	 * bch_bucket_alloc_set(), or we'd risk deadlock - so we don't pass it
+ 	 * our closure.
+ 	 */
+-	struct btree *n = btree_node_alloc_replacement(b, NULL);
++	struct btree *n = btree_node_alloc_replacement(b);
+ 
+ 	if (!IS_ERR_OR_NULL(n)) {
+ 		swap(b, n);
+@@ -1359,7 +1357,7 @@ static int bch_btree_gc_root(struct btree *b, struct btree_op *op,
+ 	int ret = 0, stale = btree_gc_mark_node(b, &keys, gc);
+ 
+ 	if (b->level || stale > 10)
+-		n = btree_node_alloc_replacement(b, NULL);
++		n = btree_node_alloc_replacement(b);
+ 
+ 	if (!IS_ERR_OR_NULL(n))
+ 		swap(b, n);
+@@ -1882,10 +1880,7 @@ static int btree_split(struct btree *b, struct btree_op *op,
+ 	struct btree *n1, *n2 = NULL, *n3 = NULL;
+ 	uint64_t start_time = local_clock();
+ 
+-	if (b->level)
+-		set_closure_blocking(&op->cl);
+-
+-	n1 = btree_node_alloc_replacement(b, &op->cl);
++	n1 = btree_node_alloc_replacement(b);
+ 	if (IS_ERR(n1))
+ 		goto err;
+ 
+@@ -1896,12 +1891,12 @@ static int btree_split(struct btree *b, struct btree_op *op,
+ 
+ 		trace_bcache_btree_node_split(b, n1->sets[0].data->keys);
+ 
+-		n2 = bch_btree_node_alloc(b->c, b->level, &op->cl);
++		n2 = bch_btree_node_alloc(b->c, b->level);
+ 		if (IS_ERR(n2))
+ 			goto err_free1;
+ 
+ 		if (!b->parent) {
+-			n3 = bch_btree_node_alloc(b->c, b->level + 1, &op->cl);
++			n3 = bch_btree_node_alloc(b->c, b->level + 1);
+ 			if (IS_ERR(n3))
+ 				goto err_free2;
+ 		}
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 72794ab..d691d95 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -355,7 +355,7 @@ static inline void rw_unlock(bool w, struct btree *b)
+ 			_r = bch_btree_ ## fn(_b, op, ##__VA_ARGS__);	\
+ 		}							\
+ 		rw_unlock(_w, _b);					\
+-		bch_cannibalize_unlock(c, &(op)->cl);			\
++		bch_cannibalize_unlock(c);				\
+ 		if (_r == -ENOSPC) {					\
+ 			wait_event((c)->try_wait,			\
+ 				   !(c)->try_harder);			\
+@@ -377,9 +377,9 @@ static inline bool should_split(struct btree *b)
+ void bch_btree_node_read(struct btree *);
+ void bch_btree_node_write(struct btree *, struct closure *);
+ 
+-void bch_cannibalize_unlock(struct cache_set *, struct closure *);
++void bch_cannibalize_unlock(struct cache_set *);
+ void bch_btree_set_root(struct btree *);
+-struct btree *bch_btree_node_alloc(struct cache_set *, int, struct closure *);
++struct btree *bch_btree_node_alloc(struct cache_set *, int);
+ struct btree *bch_btree_node_get(struct cache_set *, struct bkey *, int, bool);
+ 
+ int bch_btree_insert_check_key(struct btree *, struct btree_op *,
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index d85c700..26d18f4 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -350,14 +350,8 @@ static bool bch_alloc_sectors(struct bkey *k, unsigned sectors,
+ 	struct cache_set *c = s->op.c;
+ 	struct open_bucket *b;
+ 	BKEY_PADDED(key) alloc;
+-	struct closure cl, *w = NULL;
+ 	unsigned i;
+ 
+-	if (s->writeback) {
+-		closure_init_stack(&cl);
+-		w = &cl;
+-	}
+-
+ 	/*
+ 	 * We might have to allocate a new bucket, which we can't do with a
+ 	 * spinlock held. So if we have to allocate, we drop the lock, allocate
+@@ -375,7 +369,8 @@ static bool bch_alloc_sectors(struct bkey *k, unsigned sectors,
+ 
+ 		spin_unlock(&c->data_bucket_lock);
+ 
+-		if (bch_bucket_alloc_set(c, watermark, &alloc.key, 1, w))
++		if (bch_bucket_alloc_set(c, watermark, &alloc.key,
++					 1, s->writeback))
+ 			return false;
+ 
+ 		spin_lock(&c->data_bucket_lock);
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 9a164cd..84398a8 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -427,7 +427,7 @@ static int __uuid_write(struct cache_set *c)
+ 
+ 	lockdep_assert_held(&bch_register_lock);
+ 
+-	if (bch_bucket_alloc_set(c, WATERMARK_METADATA, &k.key, 1, &cl))
++	if (bch_bucket_alloc_set(c, WATERMARK_METADATA, &k.key, 1, true))
+ 		return 1;
+ 
+ 	SET_KEY_SIZE(&k.key, c->sb.bucket_size);
+@@ -565,7 +565,7 @@ void bch_prio_write(struct cache *ca)
+ 		p->magic	= pset_magic(ca);
+ 		p->csum		= bch_crc64(&p->magic, bucket_bytes(ca) - 8);
+ 
+-		bucket = bch_bucket_alloc(ca, WATERMARK_PRIO, &cl);
++		bucket = bch_bucket_alloc(ca, WATERMARK_PRIO, true);
+ 		BUG_ON(bucket == -1);
+ 
+ 		mutex_unlock(&ca->set->bucket_lock);
+@@ -1439,6 +1439,7 @@ struct cache_set *bch_cache_set_alloc(struct cache_sb *sb)
+ 	closure_init_unlocked(&c->sb_write);
+ 	mutex_init(&c->bucket_lock);
+ 	init_waitqueue_head(&c->try_wait);
++	init_waitqueue_head(&c->bucket_wait);
+ 	closure_init_unlocked(&c->uuid_write);
+ 	spin_lock_init(&c->sort_time_lock);
+ 	mutex_init(&c->sort_lock);
+@@ -1608,7 +1609,7 @@ static void run_cache_set(struct cache_set *c)
+ 			goto err_unlock_gc;
+ 
+ 		err = "cannot allocate new btree root";
+-		c->root = bch_btree_node_alloc(c, 0, &op.cl);
++		c->root = bch_btree_node_alloc(c, 0);
+ 		if (IS_ERR_OR_NULL(c->root))
+ 			goto err_unlock_gc;
+ 
+-- 
+2.6.2
+

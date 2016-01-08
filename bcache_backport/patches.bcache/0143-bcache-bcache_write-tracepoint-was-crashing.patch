@@ -1,0 +1,70 @@
+From 60ae81eee86dd7a520db8c1e3d702b49fc0418b5 Mon Sep 17 00:00:00 2001
+From: Slava Pestov <sp@daterainc.com>
+Date: Thu, 22 May 2014 12:14:24 -0700
+Subject: [PATCH 060631/122806] bcache: bcache_write tracepoint was crashing
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/request.c   |  3 ++-
+ include/trace/events/bcache.h | 15 +++++++++------
+ 2 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 15fff4f..62e6e98 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -311,7 +311,8 @@ void bch_data_insert(struct closure *cl)
+ {
+ 	struct data_insert_op *op = container_of(cl, struct data_insert_op, cl);
+ 
+-	trace_bcache_write(op->bio, op->writeback, op->bypass);
++	trace_bcache_write(op->c, op->inode, op->bio,
++			   op->writeback, op->bypass);
+ 
+ 	bch_keylist_init(&op->insert_keys);
+ 	bio_get(op->bio);
+diff --git a/include/trace/events/bcache.h b/include/trace/events/bcache.h
+index c9c3c04..6778e41 100644
+--- a/include/trace/events/bcache.h
++++ b/include/trace/events/bcache.h
+@@ -148,11 +148,13 @@ TRACE_EVENT(bcache_read,
+ );
+ 
+ TRACE_EVENT(bcache_write,
+-	TP_PROTO(struct bio *bio, bool writeback, bool bypass),
+-	TP_ARGS(bio, writeback, bypass),
++	TP_PROTO(struct cache_set *c, u64 inode, struct bio *bio,
++		bool writeback, bool bypass),
++	TP_ARGS(c, inode, bio, writeback, bypass),
+ 
+ 	TP_STRUCT__entry(
+-		__field(dev_t,		dev			)
++		__array(char,		uuid,	16		)
++		__field(u64,		inode			)
+ 		__field(sector_t,	sector			)
+ 		__field(unsigned int,	nr_sector		)
+ 		__array(char,		rwbs,	6		)
+@@ -161,7 +163,8 @@ TRACE_EVENT(bcache_write,
+ 	),
+ 
+ 	TP_fast_assign(
+-		__entry->dev		= bio->bi_bdev->bd_dev;
++		memcpy(__entry->uuid, c->sb.set_uuid, 16);
++		__entry->inode		= inode;
+ 		__entry->sector		= bio->bi_sector;
+ 		__entry->nr_sector	= bio->bi_size >> 9;
+ 		blk_fill_rwbs(__entry->rwbs, bio->bi_rw, bio->bi_size);
+@@ -169,8 +172,8 @@ TRACE_EVENT(bcache_write,
+ 		__entry->bypass = bypass;
+ 	),
+ 
+-	TP_printk("%d,%d  %s %llu + %u hit %u bypass %u",
+-		  MAJOR(__entry->dev), MINOR(__entry->dev),
++	TP_printk("%pU inode %llu  %s %llu + %u hit %u bypass %u",
++		  __entry->uuid, __entry->inode,
+ 		  __entry->rwbs, (unsigned long long)__entry->sector,
+ 		  __entry->nr_sector, __entry->writeback, __entry->bypass)
+ );
+-- 
+2.6.2
+

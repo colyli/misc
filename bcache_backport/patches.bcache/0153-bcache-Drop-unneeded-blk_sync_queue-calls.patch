@@ -1,0 +1,47 @@
+From 0781c8748cf1ea2b0dcd966571103909528c4efa Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 7 Jul 2014 13:03:36 -0700
+Subject: [PATCH 060641/122806] bcache: Drop unneeded blk_sync_queue() calls
+
+this is needed for the queue/block device we created (it's done by
+blk_cleanup_queue() which we do call) - but calling it for the block devices we
+only opened is pointless.
+
+Change-Id: I53dfded14ed15b9581d10ca8399d5e1b3abbf9f2
+---
+ drivers/md/bcache/super.c | 10 ++--------
+ 1 file changed, 2 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 60e7513..d4713d0 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1084,12 +1084,8 @@ static void cached_dev_free(struct closure *cl)
+ 
+ 	mutex_unlock(&bch_register_lock);
+ 
+-	if (!IS_ERR_OR_NULL(dc->bdev)) {
+-		if (dc->bdev->bd_disk)
+-			blk_sync_queue(bdev_get_queue(dc->bdev));
+-
++	if (!IS_ERR_OR_NULL(dc->bdev))
+ 		blkdev_put(dc->bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
+-	}
+ 
+ 	wake_up(&unregister_wait);
+ 
+@@ -1817,10 +1813,8 @@ void bch_cache_release(struct kobject *kobj)
+ 	if (ca->sb_bio.bi_inline_vecs[0].bv_page)
+ 		put_page(ca->sb_bio.bi_io_vec[0].bv_page);
+ 
+-	if (!IS_ERR_OR_NULL(ca->bdev)) {
+-		blk_sync_queue(bdev_get_queue(ca->bdev));
++	if (!IS_ERR_OR_NULL(ca->bdev))
+ 		blkdev_put(ca->bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
+-	}
+ 
+ 	kfree(ca);
+ 	module_put(THIS_MODULE);
+-- 
+2.6.2
+

@@ -1,0 +1,77 @@
+From 0eacac22034ca21c73fe49e800d0b938b2047250 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 1 Jul 2013 19:29:05 -0700
+Subject: [PATCH 009469/122806] bcache: PRECEDING_KEY()
+
+btree_insert_key() was open coding this, this is just refactoring.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.h  | 18 ++++++++++++++++++
+ drivers/md/bcache/btree.c |  9 ++-------
+ 2 files changed, 20 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index e673860..bc99755 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -353,12 +353,30 @@ void bch_bset_fix_lookup_table(struct btree *, struct bkey *);
+ struct bkey *__bch_bset_search(struct btree *, struct bset_tree *,
+ 			   const struct bkey *);
+ 
++/*
++ * Returns the first key that is strictly greater than search
++ */
+ static inline struct bkey *bch_bset_search(struct btree *b, struct bset_tree *t,
+ 					   const struct bkey *search)
+ {
+ 	return search ? __bch_bset_search(b, t, search) : t->data->start;
+ }
+ 
++#define PRECEDING_KEY(_k)					\
++({								\
++	struct bkey *_ret = NULL;				\
++								\
++	if (KEY_INODE(_k) || KEY_OFFSET(_k)) {			\
++		_ret = &KEY(KEY_INODE(_k), KEY_OFFSET(_k), 0);	\
++								\
++		if (!_ret->low)					\
++			_ret->high--;				\
++		_ret->low--;					\
++	}							\
++								\
++	_ret;							\
++})
++
+ bool bch_bkey_try_merge(struct btree *, struct bkey *, struct bkey *);
+ void bch_btree_sort_lazy(struct btree *);
+ void bch_btree_sort_into(struct btree *, struct btree *);
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 7dff73b..773b0e9 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -1844,19 +1844,14 @@ static bool btree_insert_key(struct btree *b, struct btree_op *op,
+ 
+ 	if (!b->level) {
+ 		struct btree_iter iter;
+-		struct bkey search = KEY(KEY_INODE(k), KEY_START(k), 0);
+ 
+ 		/*
+ 		 * bset_search() returns the first key that is strictly greater
+ 		 * than the search key - but for back merging, we want to find
+-		 * the first key that is greater than or equal to KEY_START(k) -
+-		 * unless KEY_START(k) is 0.
++		 * the previous key.
+ 		 */
+-		if (KEY_OFFSET(&search))
+-			SET_KEY_OFFSET(&search, KEY_OFFSET(&search) - 1);
+-
+ 		prev = NULL;
+-		m = bch_btree_iter_init(b, &iter, &search);
++		m = bch_btree_iter_init(b, &iter, PRECEDING_KEY(&START_KEY(k)));
+ 
+ 		if (fix_overlapping_extents(b, k, &iter, replace_key)) {
+ 			op->insert_collision = true;
+-- 
+2.6.2
+

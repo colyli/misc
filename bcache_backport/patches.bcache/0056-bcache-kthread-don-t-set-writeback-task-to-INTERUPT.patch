@@ -1,0 +1,32 @@
+From f665c0f852316ff99e9eb7f71f34d43003f8e139 Mon Sep 17 00:00:00 2001
+From: Stefan Priebe <s.priebe@profihost.ag>
+Date: Sat, 16 Nov 2013 21:26:52 +0100
+Subject: [PATCH 015427/122806] bcache: kthread don't set writeback task to
+ INTERUPTIBLE
+
+at the beginning (schedule_timout_interuptible) and others
+do his on their own
+
+This prevents wrong load average calculation (load of 1 per thread)
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/writeback.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index 99053b1..484e57d 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -500,8 +500,6 @@ int bch_cached_dev_writeback_init(struct cached_dev *dc)
+ 	if (IS_ERR(dc->writeback_thread))
+ 		return PTR_ERR(dc->writeback_thread);
+ 
+-	set_task_state(dc->writeback_thread, TASK_INTERRUPTIBLE);
+-
+ 	INIT_DELAYED_WORK(&dc->writeback_rate_update, update_writeback_rate);
+ 	schedule_delayed_work(&dc->writeback_rate_update,
+ 			      dc->writeback_rate_update_seconds * HZ);
+-- 
+2.6.2
+

@@ -1,0 +1,105 @@
+From 9aa61a992acceeec0d1de2cd99938421498659d5 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Thu, 10 Apr 2014 17:58:49 -0700
+Subject: [PATCH 060621/122806] bcache: Fix a journal replay bug
+
+journal replay wansn't validating pointers with bch_extent_invalid() before
+derefing, fixed
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/extents.c | 13 +++++++++----
+ drivers/md/bcache/extents.h |  1 +
+ drivers/md/bcache/journal.c | 16 +++++++++-------
+ 3 files changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/md/bcache/extents.c b/drivers/md/bcache/extents.c
+index 3a0de4c..243de0bf 100644
+--- a/drivers/md/bcache/extents.c
++++ b/drivers/md/bcache/extents.c
+@@ -474,9 +474,8 @@ out:
+ 	return false;
+ }
+ 
+-static bool bch_extent_invalid(struct btree_keys *bk, const struct bkey *k)
++bool __bch_extent_invalid(struct cache_set *c, const struct bkey *k)
+ {
+-	struct btree *b = container_of(bk, struct btree, keys);
+ 	char buf[80];
+ 
+ 	if (!KEY_SIZE(k))
+@@ -485,16 +484,22 @@ static bool bch_extent_invalid(struct btree_keys *bk, const struct bkey *k)
+ 	if (KEY_SIZE(k) > KEY_OFFSET(k))
+ 		goto bad;
+ 
+-	if (__ptr_invalid(b->c, k))
++	if (__ptr_invalid(c, k))
+ 		goto bad;
+ 
+ 	return false;
+ bad:
+ 	bch_extent_to_text(buf, sizeof(buf), k);
+-	cache_bug(b->c, "spotted extent %s: %s", buf, bch_ptr_status(b->c, k));
++	cache_bug(c, "spotted extent %s: %s", buf, bch_ptr_status(c, k));
+ 	return true;
+ }
+ 
++static bool bch_extent_invalid(struct btree_keys *bk, const struct bkey *k)
++{
++	struct btree *b = container_of(bk, struct btree, keys);
++	return __bch_extent_invalid(b->c, k);
++}
++
+ static bool bch_extent_bad_expensive(struct btree *b, const struct bkey *k,
+ 				     unsigned ptr)
+ {
+diff --git a/drivers/md/bcache/extents.h b/drivers/md/bcache/extents.h
+index e4e2340..e2ed540 100644
+--- a/drivers/md/bcache/extents.h
++++ b/drivers/md/bcache/extents.h
+@@ -9,5 +9,6 @@ struct cache_set;
+ 
+ void bch_extent_to_text(char *, size_t, const struct bkey *);
+ bool __bch_btree_ptr_invalid(struct cache_set *, const struct bkey *);
++bool __bch_extent_invalid(struct cache_set *, const struct bkey *);
+ 
+ #endif /* _BCACHE_EXTENTS_H */
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 59e8202..363b881 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -7,6 +7,7 @@
+ #include "bcache.h"
+ #include "btree.h"
+ #include "debug.h"
++#include "extents.h"
+ 
+ #include <trace/events/bcache.h>
+ 
+@@ -291,15 +292,16 @@ void bch_journal_mark(struct cache_set *c, struct list_head *list)
+ 
+ 		for (k = i->j.start;
+ 		     k < bset_bkey_last(&i->j);
+-		     k = bkey_next(k)) {
+-			unsigned j;
++		     k = bkey_next(k))
++			if (!__bch_extent_invalid(c, k)) {
++				unsigned j;
+ 
+-			for (j = 0; j < KEY_PTRS(k); j++)
+-				if (ptr_available(c, k, j))
+-					atomic_inc(&PTR_BUCKET(c, k, j)->pin);
++				for (j = 0; j < KEY_PTRS(k); j++)
++					if (ptr_available(c, k, j))
++						atomic_inc(&PTR_BUCKET(c, k, j)->pin);
+ 
+-			bch_initial_mark_key(c, 0, k);
+-		}
++				bch_initial_mark_key(c, 0, k);
++			}
+ 	}
+ }
+ 
+-- 
+2.6.2
+

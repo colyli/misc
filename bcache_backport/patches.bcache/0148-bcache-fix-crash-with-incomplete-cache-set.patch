@@ -1,0 +1,54 @@
+From bf0c55c986540483c34ca640f2eef4c3314388b1 Mon Sep 17 00:00:00 2001
+From: Slava Pestov <sp@daterainc.com>
+Date: Fri, 11 Jul 2014 12:17:41 -0700
+Subject: [PATCH 060636/122806] bcache: fix crash with incomplete cache set
+
+Change-Id: I6abde52afe917633480caaf4e2518f42a816d886
+---
+ drivers/md/bcache/bcache.h | 4 ++++
+ drivers/md/bcache/super.c  | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index d2ebcf3..04f7bc2 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -477,9 +477,13 @@ struct gc_stat {
+  * CACHE_SET_STOPPING always gets set first when we're closing down a cache set;
+  * we'll continue to run normally for awhile with CACHE_SET_STOPPING set (i.e.
+  * flushing dirty data).
++ *
++ * CACHE_SET_RUNNING means all cache devices have been registered and journal
++ * replay is complete.
+  */
+ #define CACHE_SET_UNREGISTERING		0
+ #define	CACHE_SET_STOPPING		1
++#define	CACHE_SET_RUNNING		2
+ 
+ struct cache_set {
+ 	struct closure		cl;
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 29dd1e8..72fbaf7 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1284,6 +1284,9 @@ int bch_flash_dev_create(struct cache_set *c, uint64_t size)
+ 	if (test_bit(CACHE_SET_STOPPING, &c->flags))
+ 		return -EINTR;
+ 
++	if (!test_bit(CACHE_SET_RUNNING, &c->flags))
++		return -EPERM;
++
+ 	u = uuid_find_empty(c);
+ 	if (!u) {
+ 		pr_err("Can't create volume, no room for UUID");
+@@ -1706,6 +1709,7 @@ static void run_cache_set(struct cache_set *c)
+ 
+ 	flash_devs_run(c);
+ 
++	set_bit(CACHE_SET_RUNNING, &c->flags);
+ 	return;
+ err:
+ 	closure_sync(&cl);
+-- 
+2.6.2
+

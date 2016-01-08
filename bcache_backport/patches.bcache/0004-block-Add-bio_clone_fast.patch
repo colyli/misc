@@ -1,0 +1,135 @@
+From 59d276fe02d7e887a4825ef05c80b8f8c54ba60a Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Sat, 23 Nov 2013 18:19:27 -0800
+Subject: [PATCH] block: Add bio_clone_fast()
+
+bio_clone() just got more expensive - however, most users of bio_clone()
+don't actually need to modify the biovec. If they aren't modifying the
+biovec, and they can guarantee that the original bio isn't freed before
+the clone (also true in most cases), we can just point the clone at the
+original bio's biovec.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/request.c |  8 ++----
+ fs/bio.c                    | 60 +++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/bio.h         |  2 ++
+ 3 files changed, 64 insertions(+), 6 deletions(-)
+
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/request.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+@@ -613,7 +613,6 @@ struct search {
+ 
+ 	struct btree_op		op;
+ 	struct data_insert_op	iop;
+-	struct bio_vec		bv[BIO_MAX_PAGES];
+ };
+ 
+ static void bch_cache_read_endio(struct bio *bio, int error)
+@@ -761,9 +760,7 @@ static void do_bio_hook(struct search *s
+ 	struct bio *bio = &s->bio.bio;
+ 
+ 	bio_init(bio);
+-	bio->bi_io_vec		= s->bv;
+-	bio->bi_max_vecs	= BIO_MAX_PAGES;
+-	__bio_clone(bio, s->orig_bio);
++	__bio_clone_fast(bio, s->orig_bio);
+ 	bio->bi_end_io		= request_endio;
+ 	bio->bi_private		= &s->cl;
+ 
+@@ -1065,8 +1062,7 @@ static void cached_dev_write(struct cach
+ 			closure_bio_submit(flush, cl, s->d);
+ 		}
+ 	} else {
+-		s->iop.bio = bio_clone_bioset(bio, GFP_NOIO,
+-					      dc->disk.bio_split);
++		s->iop.bio = bio_clone_fast(bio, GFP_NOIO, dc->disk.bio_split);
+ 
+ 		closure_bio_submit(bio, cl, s->d);
+ 	}
+Index: linux-3.12-SLE12-SP1/fs/bio.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/fs/bio.c
++++ linux-3.12-SLE12-SP1/fs/bio.c
+@@ -543,6 +543,66 @@ void __bio_clone(struct bio *bio, struct
+ EXPORT_SYMBOL(__bio_clone);
+ 
+ /**
++ *	__bio_clone_fast - clone a bio that shares the original bio's biovec
++ *	@bio: destination bio
++ *	@bio_src: bio to clone
++ *
++ *	Clone a &bio. Caller will own the returned bio, but not
++ *	the actual data it points to. Reference count of returned
++ *	bio will be one.
++ *
++ *	Caller must ensure that @bio_src is not freed before @bio.
++ */
++void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
++{
++	BUG_ON(bio->bi_pool && BIO_POOL_IDX(bio) != BIO_POOL_NONE);
++
++	/*
++	 * most users will be overriding ->bi_bdev with a new target,
++	 * so we don't set nor calculate new physical/hw segment counts here
++	 */
++	bio->bi_bdev = bio_src->bi_bdev;
++	bio->bi_flags |= 1 << BIO_CLONED;
++	bio->bi_rw = bio_src->bi_rw;
++	bio->bi_iter = bio_src->bi_iter;
++	bio->bi_io_vec = bio_src->bi_io_vec;
++}
++EXPORT_SYMBOL(__bio_clone_fast);
++
++/**
++ *	bio_clone_fast - clone a bio that shares the original bio's biovec
++ *	@bio: bio to clone
++ *	@gfp_mask: allocation priority
++ *	@bs: bio_set to allocate from
++ *
++ *	Like __bio_clone_fast, only also allocates the returned bio
++ */
++struct bio *bio_clone_fast(struct bio *bio, gfp_t gfp_mask, struct bio_set *bs)
++{
++	struct bio *b;
++
++	b = bio_alloc_bioset(gfp_mask, 0, bs);
++	if (!b)
++		return NULL;
++
++	__bio_clone_fast(b, bio);
++
++	if (bio_integrity(bio)) {
++		int ret;
++
++		ret = bio_integrity_clone(b, bio, gfp_mask);
++
++		if (ret < 0) {
++			bio_put(b);
++			return NULL;
++		}
++	}
++
++	return b;
++}
++EXPORT_SYMBOL(bio_clone_fast);
++
++/**
+  *	bio_clone_bioset -	clone a bio
+  *	@bio: bio to clone
+  *	@gfp_mask: allocation priority
+Index: linux-3.12-SLE12-SP1/include/linux/bio.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/include/linux/bio.h
++++ linux-3.12-SLE12-SP1/include/linux/bio.h
+@@ -227,6 +227,8 @@ extern mempool_t *biovec_create_pool(str
+ extern struct bio *bio_alloc_bioset(gfp_t, int, struct bio_set *);
+ extern void bio_put(struct bio *);
+ 
++extern void __bio_clone_fast(struct bio *, struct bio *);
++extern struct bio *bio_clone_fast(struct bio *, gfp_t, struct bio_set *);
+ extern void __bio_clone(struct bio *, struct bio *);
+ extern struct bio *bio_clone_bioset(struct bio *, gfp_t, struct bio_set *bs);
+ 

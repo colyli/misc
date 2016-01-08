@@ -1,0 +1,102 @@
+From 88b9f8c426f35e04738220c1bc05dd1ea1b513a3 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Tue, 17 Dec 2013 21:46:35 -0800
+Subject: [PATCH 019171/122806] bcache: kill index()
+
+That was a terrible name for a macro, add some better helpers to replace it.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h |  4 ----
+ drivers/md/bcache/btree.c  |  6 +++---
+ drivers/md/bcache/btree.h  | 20 ++++++++++++++++++++
+ drivers/md/bcache/debug.c  |  2 +-
+ 4 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 94d346e..d955a49 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -736,10 +736,6 @@ static inline unsigned local_clock_us(void)
+ #define node(i, j)		((struct bkey *) ((i)->d + (j)))
+ #define end(i)			node(i, (i)->keys)
+ 
+-#define index(i, b)							\
+-	((size_t) (((void *) i - (void *) (b)->sets[0].data) /		\
+-		   block_bytes(b->c)))
+-
+ #define btree_data_space(b)	(PAGE_SIZE << (b)->page_order)
+ 
+ #define prios_per_bucket(c)				\
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 5a6b752..8e2573a 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -258,7 +258,7 @@ static void bch_btree_node_read_done(struct btree *b)
+ 
+ 	err = "corrupted btree";
+ 	for (i = write_block(b);
+-	     index(i, b) < btree_blocks(b);
++	     bset_sector_offset(b, i) < KEY_SIZE(&b->key);
+ 	     i = ((void *) i) + block_bytes(b->c))
+ 		if (i->seq == b->sets[0].data->seq)
+ 			goto err;
+@@ -278,9 +278,9 @@ out:
+ 	return;
+ err:
+ 	set_btree_node_io_error(b);
+-	bch_cache_set_error(b->c, "%s at bucket %zu, block %zu, %u keys",
++	bch_cache_set_error(b->c, "%s at bucket %zu, block %u, %u keys",
+ 			    err, PTR_BUCKET_NR(b->c, &b->key, 0),
+-			    index(i, b), i->keys);
++			    bset_block_offset(b, i), i->keys);
+ 	goto out;
+ }
+ 
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 4f0378a..12c99b1 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -185,6 +185,26 @@ static inline unsigned bset_offset(struct btree *b, struct bset *i)
+ 	return (((size_t) i) - ((size_t) b->sets->data)) >> 9;
+ }
+ 
++static inline struct bset *btree_bset_first(struct btree *b)
++{
++	return b->sets->data;
++}
++
++static inline unsigned bset_byte_offset(struct btree *b, struct bset *i)
++{
++	return ((size_t) i) - ((size_t) b->sets->data);
++}
++
++static inline unsigned bset_sector_offset(struct btree *b, struct bset *i)
++{
++	return (((void *) i) - ((void *) btree_bset_first(b))) >> 9;
++}
++
++static inline unsigned bset_block_offset(struct btree *b, struct bset *i)
++{
++	return bset_sector_offset(b, i) >> b->c->block_bits;
++}
++
+ static inline struct bset *write_block(struct btree *b)
+ {
+ 	return ((void *) b->sets[0].data) + b->written * block_bytes(b->c);
+diff --git a/drivers/md/bcache/debug.c b/drivers/md/bcache/debug.c
+index fab3767..473e8d5 100644
+--- a/drivers/md/bcache/debug.c
++++ b/drivers/md/bcache/debug.c
+@@ -88,7 +88,7 @@ static void dump_bset(struct btree *b, struct bset *i)
+ 		next = bkey_next(k);
+ 
+ 		bch_bkey_to_text(buf, sizeof(buf), k);
+-		printk(KERN_ERR "block %zu key %zi/%u: %s", index(i, b),
++		printk(KERN_ERR "block %u key %zi/%u: %s", bset_block_offset(b, i),
+ 		       (uint64_t *) k - i->d, i->keys, buf);
+ 
+ 		for (j = 0; j < KEY_PTRS(k); j++) {
+-- 
+2.6.2
+

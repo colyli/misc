@@ -1,0 +1,35 @@
+From b0f32a56f27eb0df4124dbfc8eb6f09f423eed99 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Tue, 10 Dec 2013 13:24:26 -0800
+Subject: [PATCH 019162/122806] bcache: Minor btree cache fix
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.c | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 946ecd3..aaa87b3 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -714,14 +714,10 @@ static unsigned long bch_mca_scan(struct shrinker *shrink,
+ 		}
+ 	}
+ 
+-	/*
+-	 * Can happen right when we first start up, before we've read in any
+-	 * btree nodes
+-	 */
+-	if (list_empty(&c->btree_cache))
+-		goto out;
+-
+ 	for (i = 0; (nr--) && i < c->bucket_cache_used; i++) {
++		if (list_empty(&c->btree_cache))
++			goto out;
++
+ 		b = list_first_entry(&c->btree_cache, struct btree, list);
+ 		list_rotate_left(&c->btree_cache);
+ 
+-- 
+2.6.2
+

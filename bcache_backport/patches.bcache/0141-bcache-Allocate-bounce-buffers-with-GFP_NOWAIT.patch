@@ -1,0 +1,43 @@
+From 501d52a90cbe652b41336c206ff0e95799d5a9b5 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 19 May 2014 08:55:40 -0700
+Subject: [PATCH 060629/122806] bcache: Allocate bounce buffers with GFP_NOWAIT
+
+There's no point in blocking on these allocations, since our fallback paths will
+probably go faster than blocking.
+
+Change-Id: I733ca202c25cb36bde02607a0a60552229a4241c
+---
+ drivers/md/bcache/bset.c  | 2 +-
+ drivers/md/bcache/btree.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index 5454164..646fe85 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -1182,7 +1182,7 @@ static void __btree_sort(struct btree_keys *b, struct btree_iter *iter,
+ {
+ 	uint64_t start_time;
+ 	bool used_mempool = false;
+-	struct bset *out = (void *) __get_free_pages(__GFP_NOWARN|GFP_NOIO,
++	struct bset *out = (void *) __get_free_pages(__GFP_NOWARN|GFP_NOWAIT,
+ 						     order);
+ 	if (!out) {
+ 		struct page *outp;
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index e538d45..39c7f5b 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -421,7 +421,7 @@ static void do_btree_node_write(struct btree *b)
+ 	SET_PTR_OFFSET(&k.key, 0, PTR_OFFSET(&k.key, 0) +
+ 		       bset_sector_offset(&b->keys, i));
+ 
+-	if (!bio_alloc_pages(b->bio, GFP_NOIO)) {
++	if (!bio_alloc_pages(b->bio, __GFP_NOWARN|GFP_NOWAIT)) {
+ 		int j;
+ 		struct bio_vec *bv;
+ 		void *base = (void *) ((unsigned long) i & ~(PAGE_SIZE - 1));
+-- 
+2.6.2
+

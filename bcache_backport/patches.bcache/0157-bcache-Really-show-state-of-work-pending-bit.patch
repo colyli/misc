@@ -1,0 +1,46 @@
+From 8d090f47315507c3064ca4eefa9a1da52390b52e Mon Sep 17 00:00:00 2001
+From: Petr Mladek <pmladek@suse.com>
+Date: Mon, 5 Oct 2015 14:39:52 +0200
+Subject: [PATCH 122806/122806] bcache: Really show state of work pending bit
+
+WORK_STRUCT_PENDING is a mask for testing the pending bit.
+test_bit() expects the number of the bit and we need to
+use WORK_STRUCT_PENDING_BIT there.
+
+Also work_data_bits() is defined in workqueues.h now.
+
+I have noticed this just by chance when looking how
+WORK_STRUCT_PENDING_BIT is used. The change is compile
+tested.
+
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+---
+ drivers/md/bcache/closure.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/drivers/md/bcache/closure.c b/drivers/md/bcache/closure.c
+index 7a228de..9eaf1d6 100644
+--- a/drivers/md/bcache/closure.c
++++ b/drivers/md/bcache/closure.c
+@@ -167,8 +167,6 @@ EXPORT_SYMBOL(closure_debug_destroy);
+ 
+ static struct dentry *debug;
+ 
+-#define work_data_bits(work) ((unsigned long *)(&(work)->data))
+-
+ static int debug_seq_show(struct seq_file *f, void *data)
+ {
+ 	struct closure *cl;
+@@ -182,7 +180,7 @@ static int debug_seq_show(struct seq_file *f, void *data)
+ 			   r & CLOSURE_REMAINING_MASK);
+ 
+ 		seq_printf(f, "%s%s%s%s\n",
+-			   test_bit(WORK_STRUCT_PENDING,
++			   test_bit(WORK_STRUCT_PENDING_BIT,
+ 				    work_data_bits(&cl->work)) ? "Q" : "",
+ 			   r & CLOSURE_RUNNING	? "R" : "",
+ 			   r & CLOSURE_STACK	? "S" : "",
+-- 
+2.6.2
+

@@ -1,0 +1,132 @@
+From 085d2a3dd4d65b7bce1dead987c647dbbc014281 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 11 Nov 2013 18:20:51 -0800
+Subject: [PATCH 019175/122806] bcache: Make bch_keylist_realloc() take u64s,
+ not nptrs
+
+Getting away from KEY_PTRS and moving toward KEY_U64s - and getting rid of magic
+2s
+
+Also - split out the part that checks against journal entry size so as to avoid
+a dependancy on struct cache_set in bset.c
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c    | 12 ++----------
+ drivers/md/bcache/bset.h    |  2 +-
+ drivers/md/bcache/btree.c   |  6 +++---
+ drivers/md/bcache/request.c | 22 ++++++++++++++++++++--
+ 4 files changed, 26 insertions(+), 16 deletions(-)
+
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bset.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bset.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bset.c
+@@ -14,21 +14,13 @@
+ 
+ /* Keylists */
+ 
+-int bch_keylist_realloc(struct keylist *l, int nptrs, struct cache_set *c)
++int __bch_keylist_realloc(struct keylist *l, unsigned u64s)
+ {
+ 	size_t oldsize = bch_keylist_nkeys(l);
+-	size_t newsize = oldsize + 2 + nptrs;
++	size_t newsize = oldsize + u64s;
+ 	uint64_t *old_keys = l->keys_p == l->inline_keys ? NULL : l->keys_p;
+ 	uint64_t *new_keys;
+ 
+-	/* The journalling code doesn't handle the case where the keys to insert
+-	 * is bigger than an empty write: If we just return -ENOMEM here,
+-	 * bio_insert() and bio_invalidate() will insert the keys created so far
+-	 * and finish the rest when the keylist is empty.
+-	 */
+-	if (newsize * sizeof(uint64_t) > block_bytes(c) - sizeof(struct jset))
+-		return -ENOMEM;
+-
+ 	newsize = roundup_pow_of_two(newsize);
+ 
+ 	if (newsize <= KEYLIST_INLINE ||
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/bset.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/bset.h
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/bset.h
+@@ -259,7 +259,7 @@ static inline size_t bch_keylist_bytes(s
+ 
+ struct bkey *bch_keylist_pop(struct keylist *);
+ void bch_keylist_pop_front(struct keylist *);
+-int bch_keylist_realloc(struct keylist *, int, struct cache_set *);
++int __bch_keylist_realloc(struct keylist *, unsigned);
+ 
+ void bch_bkey_copy_single_ptr(struct bkey *, const struct bkey *,
+ 			      unsigned);
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/btree.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/btree.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/btree.c
+@@ -1356,8 +1356,8 @@ static int btree_gc_coalesce(struct btre
+ 
+ 		n2->keys -= keys;
+ 
+-		if (bch_keylist_realloc(keylist,
+-					KEY_PTRS(&new_nodes[i]->key), b->c))
++		if (__bch_keylist_realloc(keylist,
++					  bkey_u64s(&new_nodes[i]->key)))
+ 			goto out_nocoalesce;
+ 
+ 		bch_btree_node_write(new_nodes[i], &cl);
+@@ -1365,7 +1365,7 @@ static int btree_gc_coalesce(struct btre
+ 	}
+ 
+ 	for (i = 0; i < nodes; i++) {
+-		if (bch_keylist_realloc(keylist, KEY_PTRS(&r[i].b->key), b->c))
++		if (__bch_keylist_realloc(keylist, bkey_u64s(&r[i].b->key)))
+ 			goto out_nocoalesce;
+ 
+ 		make_btree_freeing_key(r[i].b, keylist->top);
+Index: linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/drivers/md/bcache/request.c
++++ linux-3.12-SLE12-SP1/drivers/md/bcache/request.c
+@@ -255,6 +255,24 @@ static void bch_data_insert_keys(struct
+ 	closure_return(cl);
+ }
+ 
++static int bch_keylist_realloc(struct keylist *l, unsigned u64s,
++			       struct cache_set *c)
++{
++	size_t oldsize = bch_keylist_nkeys(l);
++	size_t newsize = oldsize + u64s;
++
++	/*
++	 * The journalling code doesn't handle the case where the keys to insert
++	 * is bigger than an empty write: If we just return -ENOMEM here,
++	 * bio_insert() and bio_invalidate() will insert the keys created so far
++	 * and finish the rest when the keylist is empty.
++	 */
++	if (newsize * sizeof(uint64_t) > block_bytes(c) - sizeof(struct jset))
++		return -ENOMEM;
++
++	return __bch_keylist_realloc(l, u64s);
++}
++
+ static void bch_data_invalidate(struct closure *cl)
+ {
+ 	struct data_insert_op *op = container_of(cl, struct data_insert_op, cl);
+@@ -267,7 +285,7 @@ static void bch_data_invalidate(struct c
+ 		unsigned sectors = min(bio_sectors(bio),
+ 				       1U << (KEY_SIZE_BITS - 1));
+ 
+-		if (bch_keylist_realloc(&op->insert_keys, 0, op->c))
++		if (bch_keylist_realloc(&op->insert_keys, 2, op->c))
+ 			goto out;
+ 
+ 		bio->bi_sector	+= sectors;
+@@ -357,7 +375,7 @@ static void bch_data_insert_start(struct
+ 
+ 		/* 1 for the device pointer and 1 for the chksum */
+ 		if (bch_keylist_realloc(&op->insert_keys,
+-					1 + (op->csum ? 1 : 0),
++					3 + (op->csum ? 1 : 0),
+ 					op->c))
+ 			continue_at(cl, bch_data_insert_keys, bcache_wq);
+ 

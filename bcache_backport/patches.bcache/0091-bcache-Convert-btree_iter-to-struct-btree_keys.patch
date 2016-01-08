@@ -1,0 +1,331 @@
+From c052dd9a26f60bcf70c0c3fcc08e07abb60295cd Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 11 Nov 2013 17:35:24 -0800
+Subject: [PATCH 019184/122806] bcache: Convert btree_iter to struct btree_keys
+
+More work to disentangle bset.c from struct btree
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c  | 22 +++++++++++-----------
+ drivers/md/bcache/bset.h  | 19 ++++++++++++++-----
+ drivers/md/bcache/btree.c | 22 +++++++++++-----------
+ drivers/md/bcache/btree.h |  8 --------
+ drivers/md/bcache/debug.c |  6 ++++--
+ drivers/md/bcache/sysfs.c |  2 +-
+ 6 files changed, 41 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index a3ffc37..097bd8d 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -764,7 +764,7 @@ static struct bset_search_iter bset_search_tree(struct bset_tree *t,
+ 	return (struct bset_search_iter) {l, r};
+ }
+ 
+-struct bkey *__bch_bset_search(struct btree *b, struct bset_tree *t,
++struct bkey *__bch_bset_search(struct btree_keys *b, struct bset_tree *t,
+ 			       const struct bkey *search)
+ {
+ 	struct bset_search_iter i;
+@@ -787,7 +787,7 @@ struct bkey *__bch_bset_search(struct btree *b, struct bset_tree *t,
+ 	if (unlikely(!t->size)) {
+ 		i.l = t->data->start;
+ 		i.r = bset_bkey_last(t->data);
+-	} else if (bset_written(&b->keys, t)) {
++	} else if (bset_written(b, t)) {
+ 		/*
+ 		 * Each node in the auxiliary search tree covers a certain range
+ 		 * of bits, and keys above and below the set it covers might
+@@ -803,14 +803,14 @@ struct bkey *__bch_bset_search(struct btree *b, struct bset_tree *t,
+ 
+ 		i = bset_search_tree(t, search);
+ 	} else {
+-		BUG_ON(!b->keys.nsets &&
++		BUG_ON(!b->nsets &&
+ 		       t->size < bkey_to_cacheline(t, bset_bkey_last(t->data)));
+ 
+ 		i = bset_search_write_set(t, search);
+ 	}
+ 
+-	if (expensive_debug_checks(b->c)) {
+-		BUG_ON(bset_written(&b->keys, t) &&
++	if (btree_keys_expensive_checks(b)) {
++		BUG_ON(bset_written(b, t) &&
+ 		       i.l != t->data->start &&
+ 		       bkey_cmp(tree_to_prev_bkey(t,
+ 			  inorder_to_tree(bkey_to_cacheline(t, i.l), t)),
+@@ -853,7 +853,7 @@ void bch_btree_iter_push(struct btree_iter *iter, struct bkey *k,
+ 				 btree_iter_cmp));
+ }
+ 
+-static struct bkey *__bch_btree_iter_init(struct btree *b,
++static struct bkey *__bch_btree_iter_init(struct btree_keys *b,
+ 					  struct btree_iter *iter,
+ 					  struct bkey *search,
+ 					  struct bset_tree *start)
+@@ -866,7 +866,7 @@ static struct bkey *__bch_btree_iter_init(struct btree *b,
+ 	iter->b = b;
+ #endif
+ 
+-	for (; start <= bset_tree_last(&b->keys); start++) {
++	for (; start <= bset_tree_last(b); start++) {
+ 		ret = bch_bset_search(b, start, search);
+ 		bch_btree_iter_push(iter, ret, bset_bkey_last(start->data));
+ 	}
+@@ -874,11 +874,11 @@ static struct bkey *__bch_btree_iter_init(struct btree *b,
+ 	return ret;
+ }
+ 
+-struct bkey *bch_btree_iter_init(struct btree *b,
++struct bkey *bch_btree_iter_init(struct btree_keys *b,
+ 				 struct btree_iter *iter,
+ 				 struct bkey *search)
+ {
+-	return __bch_btree_iter_init(b, iter, search, b->keys.set);
++	return __bch_btree_iter_init(b, iter, search, b->set);
+ }
+ EXPORT_SYMBOL(bch_btree_iter_init);
+ 
+@@ -1047,7 +1047,7 @@ void bch_btree_sort_partial(struct btree *b, unsigned start,
+ 	struct btree_iter iter;
+ 	int oldsize = bch_count_data(b);
+ 
+-	__bch_btree_iter_init(b, &iter, NULL, &b->keys.set[start]);
++	__bch_btree_iter_init(&b->keys, &iter, NULL, &b->keys.set[start]);
+ 
+ 	if (start) {
+ 		unsigned i;
+@@ -1080,7 +1080,7 @@ void bch_btree_sort_into(struct btree *b, struct btree *new,
+ 	uint64_t start_time = local_clock();
+ 
+ 	struct btree_iter iter;
+-	bch_btree_iter_init(b, &iter, NULL);
++	bch_btree_iter_init(&b->keys, &iter, NULL);
+ 
+ 	btree_mergesort(&b->keys, new->keys.set->data, &iter, false, true);
+ 
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index 4913569..563130c 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -309,7 +309,7 @@ static inline bool bch_bkey_try_merge(struct btree_keys *b,
+ struct btree_iter {
+ 	size_t size, used;
+ #ifdef CONFIG_BCACHE_DEBUG
+-	struct btree *b;
++	struct btree_keys *b;
+ #endif
+ 	struct btree_iter_set {
+ 		struct bkey *k, *end;
+@@ -323,21 +323,30 @@ struct bkey *bch_btree_iter_next_filter(struct btree_iter *,
+ 					struct btree_keys *, ptr_filter_fn);
+ 
+ void bch_btree_iter_push(struct btree_iter *, struct bkey *, struct bkey *);
+-struct bkey *bch_btree_iter_init(struct btree *, struct btree_iter *,
++struct bkey *bch_btree_iter_init(struct btree_keys *, struct btree_iter *,
+ 				 struct bkey *);
+ 
+-struct bkey *__bch_bset_search(struct btree *, struct bset_tree *,
+-			   const struct bkey *);
++struct bkey *__bch_bset_search(struct btree_keys *, struct bset_tree *,
++			       const struct bkey *);
+ 
+ /*
+  * Returns the first key that is strictly greater than search
+  */
+-static inline struct bkey *bch_bset_search(struct btree *b, struct bset_tree *t,
++static inline struct bkey *bch_bset_search(struct btree_keys *b,
++					   struct bset_tree *t,
+ 					   const struct bkey *search)
+ {
+ 	return search ? __bch_bset_search(b, t, search) : t->data->start;
+ }
+ 
++#define for_each_key_filter(b, k, iter, filter)				\
++	for (bch_btree_iter_init((b), (iter), NULL);			\
++	     ((k) = bch_btree_iter_next_filter((iter), (b), filter));)
++
++#define for_each_key(b, k, iter)					\
++	for (bch_btree_iter_init((b), (iter), NULL);			\
++	     ((k) = bch_btree_iter_next(iter));)
++
+ /* Sorting */
+ 
+ struct bset_sort_state {
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 2c90003..9424c8a 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -212,7 +212,7 @@ void bch_btree_node_read_done(struct btree *b)
+ 	iter->used = 0;
+ 
+ #ifdef CONFIG_BCACHE_DEBUG
+-	iter->b = b;
++	iter->b = &b->keys;
+ #endif
+ 
+ 	if (!i->seq)
+@@ -1195,7 +1195,7 @@ static bool btree_gc_mark_node(struct btree *b, struct gc_stat *gc)
+ 
+ 	gc->nodes++;
+ 
+-	for_each_key_filter(b, k, &iter, bch_ptr_invalid) {
++	for_each_key_filter(&b->keys, k, &iter, bch_ptr_invalid) {
+ 		stale = max(stale, btree_mark_key(b, k));
+ 		keys++;
+ 
+@@ -1386,7 +1386,7 @@ static unsigned btree_gc_count_keys(struct btree *b)
+ 	struct btree_iter iter;
+ 	unsigned ret = 0;
+ 
+-	for_each_key_filter(b, k, &iter, bch_ptr_bad)
++	for_each_key_filter(&b->keys, k, &iter, bch_ptr_bad)
+ 		ret += bkey_u64s(k);
+ 
+ 	return ret;
+@@ -1406,7 +1406,7 @@ static int btree_gc_recurse(struct btree *b, struct btree_op *op,
+ 	struct gc_merge_info *last = r + GC_MERGE_NODES - 1;
+ 
+ 	bch_keylist_init(&keys);
+-	bch_btree_iter_init(b, &iter, &b->c->gc_done);
++	bch_btree_iter_init(&b->keys, &iter, &b->c->gc_done);
+ 
+ 	for (i = 0; i < GC_MERGE_NODES; i++)
+ 		r[i].b = ERR_PTR(-EINTR);
+@@ -1722,7 +1722,7 @@ static int bch_btree_check_recurse(struct btree *b, struct btree_op *op,
+ 	struct bucket *g;
+ 	struct btree_iter iter;
+ 
+-	for_each_key_filter(b, k, &iter, bch_ptr_invalid) {
++	for_each_key_filter(&b->keys, k, &iter, bch_ptr_invalid) {
+ 		for (i = 0; i < KEY_PTRS(k); i++) {
+ 			if (!ptr_available(b->c, k, i))
+ 				continue;
+@@ -1745,7 +1745,7 @@ static int bch_btree_check_recurse(struct btree *b, struct btree_op *op,
+ 	}
+ 
+ 	if (b->level) {
+-		bch_btree_iter_init(b, &iter, NULL);
++		bch_btree_iter_init(&b->keys, &iter, NULL);
+ 
+ 		do {
+ 			k = bch_btree_iter_next_filter(&iter, &b->keys,
+@@ -1892,7 +1892,7 @@ static bool fix_overlapping_extents(struct btree *b, struct bkey *insert,
+ 				 * depends on us inserting a new key for the top
+ 				 * here.
+ 				 */
+-				top = bch_bset_search(b,
++				top = bch_bset_search(&b->keys,
+ 						      bset_tree_last(&b->keys),
+ 						      insert);
+ 				bch_bset_insert(&b->keys, top, k);
+@@ -1965,7 +1965,7 @@ static bool btree_insert_key(struct btree *b, struct btree_op *op,
+ 		 * the previous key.
+ 		 */
+ 		prev = NULL;
+-		m = bch_btree_iter_init(b, &iter,
++		m = bch_btree_iter_init(&b->keys, &iter,
+ 					PRECEDING_KEY(&START_KEY(k)));
+ 
+ 		if (fix_overlapping_extents(b, k, &iter, replace_key)) {
+@@ -2001,7 +2001,7 @@ static bool btree_insert_key(struct btree *b, struct btree_op *op,
+ 			goto copy;
+ 	} else {
+ 		BUG_ON(replace_key);
+-		m = bch_bset_search(b, bset_tree_last(&b->keys), k);
++		m = bch_bset_search(&b->keys, bset_tree_last(&b->keys), k);
+ 	}
+ 
+ insert:	bch_bset_insert(&b->keys, m, k);
+@@ -2357,7 +2357,7 @@ static int bch_btree_map_nodes_recurse(struct btree *b, struct btree_op *op,
+ 		struct bkey *k;
+ 		struct btree_iter iter;
+ 
+-		bch_btree_iter_init(b, &iter, from);
++		bch_btree_iter_init(&b->keys, &iter, from);
+ 
+ 		while ((k = bch_btree_iter_next_filter(&iter, &b->keys,
+ 						       bch_ptr_bad))) {
+@@ -2390,7 +2390,7 @@ static int bch_btree_map_keys_recurse(struct btree *b, struct btree_op *op,
+ 	struct bkey *k;
+ 	struct btree_iter iter;
+ 
+-	bch_btree_iter_init(b, &iter, from);
++	bch_btree_iter_init(&b->keys, &iter, from);
+ 
+ 	while ((k = bch_btree_iter_next_filter(&iter, &b->keys, bch_ptr_bad))) {
+ 		ret = !b->level
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 04e81f8..af065e9 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -201,14 +201,6 @@ void bkey_put(struct cache_set *c, struct bkey *k);
+ 	     iter++)							\
+ 		hlist_for_each_entry_rcu((b), (c)->bucket_hash + iter, hash)
+ 
+-#define for_each_key_filter(b, k, iter, filter)				\
+-	for (bch_btree_iter_init((b), (iter), NULL);			\
+-	     ((k) = bch_btree_iter_next_filter((iter), &(b)->keys, filter));)
+-
+-#define for_each_key(b, k, iter)					\
+-	for (bch_btree_iter_init((b), (iter), NULL);			\
+-	     ((k) = bch_btree_iter_next(iter));)
+-
+ /* Recursing down the btree */
+ 
+ struct btree_op {
+diff --git a/drivers/md/bcache/debug.c b/drivers/md/bcache/debug.c
+index 8acc18a..3de27e2 100644
+--- a/drivers/md/bcache/debug.c
++++ b/drivers/md/bcache/debug.c
+@@ -246,7 +246,7 @@ int __bch_count_data(struct btree *b)
+ 	struct bkey *k;
+ 
+ 	if (!b->level)
+-		for_each_key(b, k, &iter)
++		for_each_key(&b->keys, k, &iter)
+ 			ret += KEY_SIZE(k);
+ 	return ret;
+ }
+@@ -258,7 +258,7 @@ void __bch_check_keys(struct btree *b, const char *fmt, ...)
+ 	struct btree_iter iter;
+ 	const char *err;
+ 
+-	for_each_key(b, k, &iter) {
++	for_each_key(&b->keys, k, &iter) {
+ 		if (!b->level) {
+ 			err = "Keys out of order";
+ 			if (p && bkey_cmp(&START_KEY(p), &START_KEY(k)) > 0)
+@@ -298,6 +298,7 @@ bug:
+ 
+ void bch_btree_iter_next_check(struct btree_iter *iter)
+ {
++#if 0
+ 	struct bkey *k = iter->data->k, *next = bkey_next(k);
+ 
+ 	if (next < iter->data->end &&
+@@ -305,6 +306,7 @@ void bch_btree_iter_next_check(struct btree_iter *iter)
+ 		bch_dump_bucket(iter->b);
+ 		panic("Key skipped backwards\n");
+ 	}
++#endif
+ }
+ 
+ #endif
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index db2111b..c6ab693 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -460,7 +460,7 @@ lock_root:
+ 			rw_lock(false, b, b->level);
+ 		} while (b != c->root);
+ 
+-		for_each_key_filter(b, k, &iter, bch_ptr_bad)
++		for_each_key_filter(&b->keys, k, &iter, bch_ptr_bad)
+ 			bytes += bkey_bytes(k);
+ 
+ 		rw_unlock(false, b);
+-- 
+2.6.2
+

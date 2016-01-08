@@ -1,0 +1,43 @@
+From 5b1016e62f74c53e0330403025954c8d95384c03 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 19 Mar 2014 17:49:37 -0700
+Subject: [PATCH 060620/122806] bcache: Fix a bug when detaching
+
+After detaching a backing device from a cache set, a bit wasn't getting
+reset meaning the second detach wouldn't work correctly.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/super.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 926ded8..1ea9fa2 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -927,6 +927,7 @@ static void cached_dev_detach_finish(struct work_struct *w)
+ 	list_move(&dc->list, &uncached_devices);
+ 
+ 	clear_bit(BCACHE_DEV_DETACHING, &dc->disk.flags);
++	clear_bit(BCACHE_DEV_UNLINK_DONE, &dc->disk.flags);
+ 
+ 	mutex_unlock(&bch_register_lock);
+ 
+@@ -1405,9 +1406,11 @@ static void cache_set_flush(struct closure *cl)
+ 		if (ca->alloc_thread)
+ 			kthread_stop(ca->alloc_thread);
+ 
+-	cancel_delayed_work_sync(&c->journal.work);
+-	/* flush last journal entry if needed */
+-	c->journal.work.work.func(&c->journal.work.work);
++	if (c->journal.cur) {
++		cancel_delayed_work_sync(&c->journal.work);
++		/* flush last journal entry if needed */
++		c->journal.work.work.func(&c->journal.work.work);
++	}
+ 
+ 	closure_return(cl);
+ }
+-- 
+2.6.2
+

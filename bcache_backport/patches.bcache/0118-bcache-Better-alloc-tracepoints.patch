@@ -1,0 +1,168 @@
+From 7159b1ad3dded9da040b5c608acf3d52d50f661e Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 12 Feb 2014 18:43:32 -0800
+Subject: [PATCH 032955/122806] bcache: Better alloc tracepoints
+
+Change the invalidate tracepoint to indicate how much data we're invalidating,
+and change the alloc tracepoints to indicate what offset they're for.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/alloc.c     | 15 ++++++++++----
+ drivers/md/bcache/trace.c     |  2 +-
+ include/trace/events/bcache.h | 48 ++++++++++++++++++++++++++++++-------------
+ 3 files changed, 46 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/md/bcache/alloc.c b/drivers/md/bcache/alloc.c
+index c0d37d0..a3e1427 100644
+--- a/drivers/md/bcache/alloc.c
++++ b/drivers/md/bcache/alloc.c
+@@ -162,10 +162,15 @@ static bool can_invalidate_bucket(struct cache *ca, struct bucket *b)
+ 
+ static void invalidate_one_bucket(struct cache *ca, struct bucket *b)
+ {
++	size_t bucket = b - ca->buckets;
++
++	if (GC_SECTORS_USED(b))
++		trace_bcache_invalidate(ca, bucket);
++
+ 	bch_inc_gen(ca, b);
+ 	b->prio = INITIAL_PRIO;
+ 	atomic_inc(&b->pin);
+-	fifo_push(&ca->free_inc, b - ca->buckets);
++	fifo_push(&ca->free_inc, bucket);
+ }
+ 
+ /*
+@@ -301,8 +306,6 @@ static void invalidate_buckets(struct cache *ca)
+ 		invalidate_buckets_random(ca);
+ 		break;
+ 	}
+-
+-	trace_bcache_alloc_invalidate(ca);
+ }
+ 
+ #define allocator_wait(ca, cond)					\
+@@ -408,8 +411,10 @@ long bch_bucket_alloc(struct cache *ca, unsigned reserve, bool wait)
+ 	    fifo_pop(&ca->free[reserve], r))
+ 		goto out;
+ 
+-	if (!wait)
++	if (!wait) {
++		trace_bcache_alloc_fail(ca, reserve);
+ 		return -1;
++	}
+ 
+ 	do {
+ 		prepare_to_wait(&ca->set->bucket_wait, &w,
+@@ -425,6 +430,8 @@ long bch_bucket_alloc(struct cache *ca, unsigned reserve, bool wait)
+ out:
+ 	wake_up_process(ca->alloc_thread);
+ 
++	trace_bcache_alloc(ca, reserve);
++
+ 	if (expensive_debug_checks(ca->set)) {
+ 		size_t iter;
+ 		long i;
+diff --git a/drivers/md/bcache/trace.c b/drivers/md/bcache/trace.c
+index adbc3df..b7820b0 100644
+--- a/drivers/md/bcache/trace.c
++++ b/drivers/md/bcache/trace.c
+@@ -45,7 +45,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(bcache_btree_node_split);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(bcache_btree_node_compact);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(bcache_btree_set_root);
+ 
+-EXPORT_TRACEPOINT_SYMBOL_GPL(bcache_alloc_invalidate);
++EXPORT_TRACEPOINT_SYMBOL_GPL(bcache_invalidate);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(bcache_alloc_fail);
+ 
+ EXPORT_TRACEPOINT_SYMBOL_GPL(bcache_writeback);
+diff --git a/include/trace/events/bcache.h b/include/trace/events/bcache.h
+index 7110897..8fc2a71 100644
+--- a/include/trace/events/bcache.h
++++ b/include/trace/events/bcache.h
+@@ -399,26 +399,43 @@ TRACE_EVENT(bcache_keyscan,
+ 
+ /* Allocator */
+ 
+-TRACE_EVENT(bcache_alloc_invalidate,
+-	TP_PROTO(struct cache *ca),
+-	TP_ARGS(ca),
++TRACE_EVENT(bcache_invalidate,
++	TP_PROTO(struct cache *ca, size_t bucket),
++	TP_ARGS(ca, bucket),
+ 
+ 	TP_STRUCT__entry(
+-		__field(unsigned,	free			)
+-		__field(unsigned,	free_inc		)
+-		__field(unsigned,	free_inc_size		)
+-		__field(unsigned,	unused			)
++		__field(unsigned,	sectors			)
++		__field(dev_t,		dev			)
++		__field(__u64,		offset			)
+ 	),
+ 
+ 	TP_fast_assign(
+-		__entry->free		= fifo_used(&ca->free[RESERVE_NONE]);
+-		__entry->free_inc	= fifo_used(&ca->free_inc);
+-		__entry->free_inc_size	= ca->free_inc.size;
+-		__entry->unused		= fifo_used(&ca->unused);
++		__entry->dev		= ca->bdev->bd_dev;
++		__entry->offset		= bucket << ca->set->bucket_bits;
++		__entry->sectors	= GC_SECTORS_USED(&ca->buckets[bucket]);
+ 	),
+ 
+-	TP_printk("free %u free_inc %u/%u unused %u", __entry->free,
+-		  __entry->free_inc, __entry->free_inc_size, __entry->unused)
++	TP_printk("invalidated %u sectors at %d,%d sector=%llu",
++		  __entry->sectors, MAJOR(__entry->dev),
++		  MINOR(__entry->dev), __entry->offset)
++);
++
++TRACE_EVENT(bcache_alloc,
++	TP_PROTO(struct cache *ca, size_t bucket),
++	TP_ARGS(ca, bucket),
++
++	TP_STRUCT__entry(
++		__field(dev_t,		dev			)
++		__field(__u64,		offset			)
++	),
++
++	TP_fast_assign(
++		__entry->dev		= ca->bdev->bd_dev;
++		__entry->offset		= bucket << ca->set->bucket_bits;
++	),
++
++	TP_printk("allocated %d,%d sector=%llu", MAJOR(__entry->dev),
++		  MINOR(__entry->dev), __entry->offset)
+ );
+ 
+ TRACE_EVENT(bcache_alloc_fail,
+@@ -426,6 +443,7 @@ TRACE_EVENT(bcache_alloc_fail,
+ 	TP_ARGS(ca, reserve),
+ 
+ 	TP_STRUCT__entry(
++		__field(dev_t,		dev			)
+ 		__field(unsigned,	free			)
+ 		__field(unsigned,	free_inc		)
+ 		__field(unsigned,	unused			)
+@@ -433,13 +451,15 @@ TRACE_EVENT(bcache_alloc_fail,
+ 	),
+ 
+ 	TP_fast_assign(
++		__entry->dev		= ca->bdev->bd_dev;
+ 		__entry->free		= fifo_used(&ca->free[reserve]);
+ 		__entry->free_inc	= fifo_used(&ca->free_inc);
+ 		__entry->unused		= fifo_used(&ca->unused);
+ 		__entry->blocked	= atomic_read(&ca->set->prio_blocked);
+ 	),
+ 
+-	TP_printk("free %u free_inc %u unused %u blocked %u", __entry->free,
++	TP_printk("alloc fail %d,%d free %u free_inc %u unused %u blocked %u",
++		  MAJOR(__entry->dev), MINOR(__entry->dev), __entry->free,
+ 		  __entry->free_inc, __entry->unused, __entry->blocked)
+ );
+ 
+-- 
+2.6.2
+

@@ -1,0 +1,205 @@
+From 89ebb4a28ba9efb5c9b18ba552e784021957b14a Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 11 Nov 2013 18:38:51 -0800
+Subject: [PATCH 019186/122806] bcache: Convert sorting to btree_keys
+
+More work to disentangle various code from struct btree
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bset.c  | 50 ++++++++++++++++++++++-------------------------
+ drivers/md/bcache/bset.h  | 13 ++++++------
+ drivers/md/bcache/btree.c |  6 +++---
+ 3 files changed, 33 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/md/bcache/bset.c b/drivers/md/bcache/bset.c
+index 448cff8..2ff75f3 100644
+--- a/drivers/md/bcache/bset.c
++++ b/drivers/md/bcache/bset.c
+@@ -5,8 +5,10 @@
+  * Copyright 2012 Google, Inc.
+  */
+ 
+-#include "bcache.h"
+-#include "btree.h"
++#define pr_fmt(fmt) "bcache: %s() " fmt "\n", __func__
++
++#include "util.h"
++#include "bset.h"
+ 
+ #include <linux/console.h>
+ #include <linux/random.h>
+@@ -1150,31 +1152,27 @@ static void __btree_sort(struct btree_keys *b, struct btree_iter *iter,
+ 		bch_time_stats_update(&state->time, start_time);
+ }
+ 
+-void bch_btree_sort_partial(struct btree *b, unsigned start,
++void bch_btree_sort_partial(struct btree_keys *b, unsigned start,
+ 			    struct bset_sort_state *state)
+ {
+-	size_t order = b->keys.page_order, keys = 0;
++	size_t order = b->page_order, keys = 0;
+ 	struct btree_iter iter;
+-	int oldsize = bch_count_data(&b->keys);
++	int oldsize = bch_count_data(b);
+ 
+-	__bch_btree_iter_init(&b->keys, &iter, NULL, &b->keys.set[start]);
++	__bch_btree_iter_init(b, &iter, NULL, &b->set[start]);
+ 
+ 	if (start) {
+ 		unsigned i;
+ 
+-		for (i = start; i <= b->keys.nsets; i++)
+-			keys += b->keys.set[i].data->keys;
++		for (i = start; i <= b->nsets; i++)
++			keys += b->set[i].data->keys;
+ 
+-		order = roundup_pow_of_two(__set_bytes(b->keys.set->data,
+-						       keys)) / PAGE_SIZE;
+-		if (order)
+-			order = ilog2(order);
++		order = get_order(__set_bytes(b->set->data, keys));
+ 	}
+ 
+-	__btree_sort(&b->keys, &iter, start, order, false, state);
++	__btree_sort(b, &iter, start, order, false, state);
+ 
+-	EBUG_ON(b->written && oldsize >= 0 &&
+-		bch_count_data(&b->keys) != oldsize);
++	EBUG_ON(oldsize >= 0 && bch_count_data(b) != oldsize);
+ }
+ EXPORT_SYMBOL(bch_btree_sort_partial);
+ 
+@@ -1185,51 +1183,49 @@ void bch_btree_sort_and_fix_extents(struct btree_keys *b,
+ 	__btree_sort(b, iter, 0, b->page_order, true, state);
+ }
+ 
+-void bch_btree_sort_into(struct btree *b, struct btree *new,
++void bch_btree_sort_into(struct btree_keys *b, struct btree_keys *new,
+ 			 struct bset_sort_state *state)
+ {
+ 	uint64_t start_time = local_clock();
+ 
+ 	struct btree_iter iter;
+-	bch_btree_iter_init(&b->keys, &iter, NULL);
++	bch_btree_iter_init(b, &iter, NULL);
+ 
+-	btree_mergesort(&b->keys, new->keys.set->data, &iter, false, true);
++	btree_mergesort(b, new->set->data, &iter, false, true);
+ 
+ 	bch_time_stats_update(&state->time, start_time);
+ 
+-	new->keys.set->size = 0; // XXX: why?
++	new->set->size = 0; // XXX: why?
+ }
+ 
+ #define SORT_CRIT	(4096 / sizeof(uint64_t))
+ 
+-void bch_btree_sort_lazy(struct btree *b, struct bset_sort_state *state)
++void bch_btree_sort_lazy(struct btree_keys *b, struct bset_sort_state *state)
+ {
+ 	unsigned crit = SORT_CRIT;
+ 	int i;
+ 
+-	b->keys.last_set_unwritten = 0;
+-
+ 	/* Don't sort if nothing to do */
+-	if (!b->keys.nsets)
++	if (!b->nsets)
+ 		goto out;
+ 
+-	for (i = b->keys.nsets - 1; i >= 0; --i) {
++	for (i = b->nsets - 1; i >= 0; --i) {
+ 		crit *= state->crit_factor;
+ 
+-		if (b->keys.set[i].data->keys < crit) {
++		if (b->set[i].data->keys < crit) {
+ 			bch_btree_sort_partial(b, i, state);
+ 			return;
+ 		}
+ 	}
+ 
+ 	/* Sort if we'd overflow */
+-	if (b->keys.nsets + 1 == MAX_BSETS) {
++	if (b->nsets + 1 == MAX_BSETS) {
+ 		bch_btree_sort(b, state);
+ 		return;
+ 	}
+ 
+ out:
+-	bch_bset_build_written_tree(&b->keys);
++	bch_bset_build_written_tree(b);
+ }
+ EXPORT_SYMBOL(bch_btree_sort_lazy);
+ 
+diff --git a/drivers/md/bcache/bset.h b/drivers/md/bcache/bset.h
+index e01e69e..4aa199d 100644
+--- a/drivers/md/bcache/bset.h
++++ b/drivers/md/bcache/bset.h
+@@ -1,7 +1,9 @@
+ #ifndef _BCACHE_BSET_H
+ #define _BCACHE_BSET_H
+ 
+-#include <linux/slab.h>
++#include <linux/bcache.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
+ 
+ #include "util.h" /* for time_stats */
+ 
+@@ -144,7 +146,6 @@
+  * first key in that range of bytes again.
+  */
+ 
+-struct btree;
+ struct btree_keys;
+ struct btree_iter;
+ struct btree_iter_set;
+@@ -353,15 +354,15 @@ struct bset_sort_state {
+ 
+ void bch_bset_sort_state_free(struct bset_sort_state *);
+ int bch_bset_sort_state_init(struct bset_sort_state *, unsigned);
+-void bch_btree_sort_lazy(struct btree *, struct bset_sort_state *);
+-void bch_btree_sort_into(struct btree *, struct btree *,
++void bch_btree_sort_lazy(struct btree_keys *, struct bset_sort_state *);
++void bch_btree_sort_into(struct btree_keys *, struct btree_keys *,
+ 			 struct bset_sort_state *);
+ void bch_btree_sort_and_fix_extents(struct btree_keys *, struct btree_iter *,
+ 				    struct bset_sort_state *);
+-void bch_btree_sort_partial(struct btree *, unsigned,
++void bch_btree_sort_partial(struct btree_keys *, unsigned,
+ 			    struct bset_sort_state *);
+ 
+-static inline void bch_btree_sort(struct btree *b,
++static inline void bch_btree_sort(struct btree_keys *b,
+ 				  struct bset_sort_state *state)
+ {
+ 	bch_btree_sort_partial(b, 0, state);
+diff --git a/drivers/md/bcache/btree.c b/drivers/md/bcache/btree.c
+index 2128ee1..b14f34a 100644
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -480,9 +480,9 @@ void bch_btree_node_write(struct btree *b, struct closure *parent)
+ 
+ 	/* If not a leaf node, always sort */
+ 	if (b->level && b->keys.nsets)
+-		bch_btree_sort(b, &b->c->sort);
++		bch_btree_sort(&b->keys, &b->c->sort);
+ 	else
+-		bch_btree_sort_lazy(b, &b->c->sort);
++		bch_btree_sort_lazy(&b->keys, &b->c->sort);
+ 
+ 	/*
+ 	 * do verify if there was more than one set initially (i.e. we did a
+@@ -1087,7 +1087,7 @@ static struct btree *btree_node_alloc_replacement(struct btree *b, bool wait)
+ {
+ 	struct btree *n = bch_btree_node_alloc(b->c, b->level, wait);
+ 	if (!IS_ERR_OR_NULL(n)) {
+-		bch_btree_sort_into(b, n, &b->c->sort);
++		bch_btree_sort_into(&b->keys, &n->keys, &b->c->sort);
+ 		bkey_copy_key(&n->key, &b->key);
+ 	}
+ 
+-- 
+2.6.2
+

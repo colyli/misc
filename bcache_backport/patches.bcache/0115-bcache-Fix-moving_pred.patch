@@ -1,0 +1,35 @@
+From 10d9dcf6ee5909e1aabd3685c60fdd1b1306d046 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Mon, 17 Feb 2014 15:48:36 -0800
+Subject: [PATCH 032952/122806] bcache: Fix moving_pred()
+
+Avoid a potential null pointer deref (e.g. from check keys for cache misses)
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/movinggc.c | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/md/bcache/movinggc.c b/drivers/md/bcache/movinggc.c
+index 8c72051..5e8e587 100644
+--- a/drivers/md/bcache/movinggc.c
++++ b/drivers/md/bcache/movinggc.c
+@@ -24,12 +24,10 @@ static bool moving_pred(struct keybuf *buf, struct bkey *k)
+ 					   moving_gc_keys);
+ 	unsigned i;
+ 
+-	for (i = 0; i < KEY_PTRS(k); i++) {
+-		struct bucket *g = PTR_BUCKET(c, k, i);
+-
+-		if (GC_MOVE(g))
++	for (i = 0; i < KEY_PTRS(k); i++)
++		if (ptr_available(c, k, i) &&
++		    GC_MOVE(PTR_BUCKET(c, k, i)))
+ 			return true;
+-	}
+ 
+ 	return false;
+ }
+-- 
+2.6.2
+

@@ -1,0 +1,27 @@
+From 9eb8ebeb2471b8cbaa078066aeb85fe5d46f5304 Mon Sep 17 00:00:00 2001
+From: Nicholas Swenson <nks@daterainc.com>
+Date: Tue, 22 Oct 2013 13:19:23 -0700
+Subject: [PATCH 015430/122806] bcache: Fix for can_attach_cache()
+
+Signed-off-by: Nicholas Swenson <nks@daterainc.com>
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/super.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index dec15cd..c57bfa0 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1676,7 +1676,7 @@ err:
+ static bool can_attach_cache(struct cache *ca, struct cache_set *c)
+ {
+ 	return ca->sb.block_size	== c->sb.block_size &&
+-		ca->sb.bucket_size	== c->sb.block_size &&
++		ca->sb.bucket_size	== c->sb.bucket_size &&
+ 		ca->sb.nr_in_set	== c->sb.nr_in_set;
+ }
+ 
+-- 
+2.6.2
+

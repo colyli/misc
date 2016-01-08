@@ -1,0 +1,27 @@
+From 97d11a660fd906dbea3dccd2638495d8497c3c81 Mon Sep 17 00:00:00 2001
+From: Nicholas Swenson <nks@daterainc.com>
+Date: Wed, 23 Oct 2013 17:35:26 -0700
+Subject: [PATCH 015431/122806] bcache: Fix heap_peek() macro
+
+Signed-off-by: Nicholas Swenson <nks@daterainc.com>
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/util.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/util.h b/drivers/md/bcache/util.h
+index 362c4b3..1030c60 100644
+--- a/drivers/md/bcache/util.h
++++ b/drivers/md/bcache/util.h
+@@ -110,7 +110,7 @@ do {									\
+ 	_r;								\
+ })
+ 
+-#define heap_peek(h)	((h)->size ? (h)->data[0] : NULL)
++#define heap_peek(h)	((h)->used ? (h)->data[0] : NULL)
+ 
+ #define heap_full(h)	((h)->used == (h)->size)
+ 
+-- 
+2.6.2
+

@@ -1,0 +1,223 @@
+From c4d951ddb66fe1d087447b0ba65c4fa4446f1083 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 21 Aug 2013 17:49:09 -0700
+Subject: [PATCH 009479/122806] bcache: Fix sysfs splat on shutdown with flash
+ only devs
+
+Whoops.
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/bcache.h    | 10 ++++------
+ drivers/md/bcache/request.c   |  2 +-
+ drivers/md/bcache/super.c     | 41 ++++++++++++++++++++---------------------
+ drivers/md/bcache/sysfs.c     |  2 +-
+ drivers/md/bcache/writeback.c |  6 +++---
+ drivers/md/bcache/writeback.h |  2 +-
+ 6 files changed, 30 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index ab0b215..97ef126 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -266,12 +266,10 @@ struct bcache_device {
+ 
+ 	struct gendisk		*disk;
+ 
+-	/* If nonzero, we're closing */
+-	atomic_t		closing;
+-
+-	/* If nonzero, we're detaching/unregistering from cache set */
+-	atomic_t		detaching;
+-	int			flush_done;
++	unsigned long		flags;
++#define BCACHE_DEV_CLOSING	0
++#define BCACHE_DEV_DETACHING	1
++#define BCACHE_DEV_UNLINK_DONE	2
+ 
+ 	unsigned		nr_stripes;
+ 	unsigned		stripe_size;
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index f645da6..9f5a138 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -512,7 +512,7 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
+ 	struct task_struct *task = current;
+ 	struct io *i;
+ 
+-	if (atomic_read(&dc->disk.detaching) ||
++	if (test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) ||
+ 	    c->gc_stats.in_use > CUTOFF_CACHE_ADD ||
+ 	    (bio->bi_rw & REQ_DISCARD))
+ 		goto skip;
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 43fcfe3..fa1d530 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -621,7 +621,7 @@ static void prio_read(struct cache *ca, uint64_t bucket)
+ static int open_dev(struct block_device *b, fmode_t mode)
+ {
+ 	struct bcache_device *d = b->bd_disk->private_data;
+-	if (atomic_read(&d->closing))
++	if (test_bit(BCACHE_DEV_CLOSING, &d->flags))
+ 		return -ENXIO;
+ 
+ 	closure_get(&d->cl);
+@@ -650,20 +650,24 @@ static const struct block_device_operations bcache_ops = {
+ 
+ void bcache_device_stop(struct bcache_device *d)
+ {
+-	if (!atomic_xchg(&d->closing, 1))
++	if (!test_and_set_bit(BCACHE_DEV_CLOSING, &d->flags))
+ 		closure_queue(&d->cl);
+ }
+ 
+ static void bcache_device_unlink(struct bcache_device *d)
+ {
+-	unsigned i;
+-	struct cache *ca;
++	lockdep_assert_held(&bch_register_lock);
+ 
+-	sysfs_remove_link(&d->c->kobj, d->name);
+-	sysfs_remove_link(&d->kobj, "cache");
++	if (d->c && !test_and_set_bit(BCACHE_DEV_UNLINK_DONE, &d->flags)) {
++		unsigned i;
++		struct cache *ca;
+ 
+-	for_each_cache(ca, d->c, i)
+-		bd_unlink_disk_holder(ca->bdev, d->disk);
++		sysfs_remove_link(&d->c->kobj, d->name);
++		sysfs_remove_link(&d->kobj, "cache");
++
++		for_each_cache(ca, d->c, i)
++			bd_unlink_disk_holder(ca->bdev, d->disk);
++	}
+ }
+ 
+ static void bcache_device_link(struct bcache_device *d, struct cache_set *c,
+@@ -687,19 +691,16 @@ static void bcache_device_detach(struct bcache_device *d)
+ {
+ 	lockdep_assert_held(&bch_register_lock);
+ 
+-	if (atomic_read(&d->detaching)) {
++	if (test_bit(BCACHE_DEV_DETACHING, &d->flags)) {
+ 		struct uuid_entry *u = d->c->uuids + d->id;
+ 
+ 		SET_UUID_FLASH_ONLY(u, 0);
+ 		memcpy(u->uuid, invalid_uuid, 16);
+ 		u->invalidated = cpu_to_le32(get_seconds());
+ 		bch_uuid_write(d->c);
+-
+-		atomic_set(&d->detaching, 0);
+ 	}
+ 
+-	if (!d->flush_done)
+-		bcache_device_unlink(d);
++	bcache_device_unlink(d);
+ 
+ 	d->c->devices[d->id] = NULL;
+ 	closure_put(&d->c->caching);
+@@ -879,7 +880,7 @@ static void cached_dev_detach_finish(struct work_struct *w)
+ 	struct closure cl;
+ 	closure_init_stack(&cl);
+ 
+-	BUG_ON(!atomic_read(&dc->disk.detaching));
++	BUG_ON(!test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags));
+ 	BUG_ON(atomic_read(&dc->count));
+ 
+ 	mutex_lock(&bch_register_lock);
+@@ -893,6 +894,8 @@ static void cached_dev_detach_finish(struct work_struct *w)
+ 	bcache_device_detach(&dc->disk);
+ 	list_move(&dc->list, &uncached_devices);
+ 
++	clear_bit(BCACHE_DEV_DETACHING, &dc->disk.flags);
++
+ 	mutex_unlock(&bch_register_lock);
+ 
+ 	pr_info("Caching disabled for %s", bdevname(dc->bdev, buf));
+@@ -905,10 +908,10 @@ void bch_cached_dev_detach(struct cached_dev *dc)
+ {
+ 	lockdep_assert_held(&bch_register_lock);
+ 
+-	if (atomic_read(&dc->disk.closing))
++	if (test_bit(BCACHE_DEV_CLOSING, &dc->disk.flags))
+ 		return;
+ 
+-	if (atomic_xchg(&dc->disk.detaching, 1))
++	if (test_and_set_bit(BCACHE_DEV_DETACHING, &dc->disk.flags))
+ 		return;
+ 
+ 	/*
+@@ -1064,11 +1067,7 @@ static void cached_dev_flush(struct closure *cl)
+ 	struct bcache_device *d = &dc->disk;
+ 
+ 	mutex_lock(&bch_register_lock);
+-	d->flush_done = 1;
+-
+-	if (d->c)
+-		bcache_device_unlink(d);
+-
++	bcache_device_unlink(d);
+ 	mutex_unlock(&bch_register_lock);
+ 
+ 	bch_cache_accounting_destroy(&dc->accounting);
+diff --git a/drivers/md/bcache/sysfs.c b/drivers/md/bcache/sysfs.c
+index 4b67244..194d437 100644
+--- a/drivers/md/bcache/sysfs.c
++++ b/drivers/md/bcache/sysfs.c
+@@ -370,7 +370,7 @@ STORE(__bch_flash_dev)
+ 	}
+ 
+ 	if (attr == &sysfs_unregister) {
+-		atomic_set(&d->detaching, 1);
++		set_bit(BCACHE_DEV_DETACHING, &d->flags);
+ 		bcache_device_stop(d);
+ 	}
+ 
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index 22e21dc..99053b1 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -89,7 +89,7 @@ static unsigned writeback_delay(struct cached_dev *dc, unsigned sectors)
+ {
+ 	uint64_t ret;
+ 
+-	if (atomic_read(&dc->disk.detaching) ||
++	if (test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) ||
+ 	    !dc->writeback_percent)
+ 		return 0;
+ 
+@@ -404,7 +404,7 @@ static int bch_writeback_thread(void *arg)
+ 	while (!kthread_should_stop()) {
+ 		down_write(&dc->writeback_lock);
+ 		if (!atomic_read(&dc->has_dirty) ||
+-		    (!atomic_read(&dc->disk.detaching) &&
++		    (!test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) &&
+ 		     !dc->writeback_running)) {
+ 			up_write(&dc->writeback_lock);
+ 			set_current_state(TASK_INTERRUPTIBLE);
+@@ -437,7 +437,7 @@ static int bch_writeback_thread(void *arg)
+ 
+ 			while (delay &&
+ 			       !kthread_should_stop() &&
+-			       !atomic_read(&dc->disk.detaching))
++			       !test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags))
+ 				delay = schedule_timeout_interruptible(delay);
+ 		}
+ 	}
+diff --git a/drivers/md/bcache/writeback.h b/drivers/md/bcache/writeback.h
+index fe7d9d5..c9ddcf4 100644
+--- a/drivers/md/bcache/writeback.h
++++ b/drivers/md/bcache/writeback.h
+@@ -45,7 +45,7 @@ static inline bool should_writeback(struct cached_dev *dc, struct bio *bio,
+ 	unsigned in_use = dc->disk.c->gc_stats.in_use;
+ 
+ 	if (cache_mode != CACHE_MODE_WRITEBACK ||
+-	    atomic_read(&dc->disk.detaching) ||
++	    test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) ||
+ 	    in_use > CUTOFF_WRITEBACK_SYNC)
+ 		return false;
+ 
+-- 
+2.6.2
+

@@ -1,0 +1,40 @@
+From 8304ad4dc818ffd701c2f3e90683b5b8013f44e2 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kmo@daterainc.com>
+Date: Wed, 24 Jul 2013 17:20:00 -0700
+Subject: [PATCH 009437/122806] bcache: Remove unnecessary check in
+ should_split()
+
+Checking i->seq was redundant, because since ages ago we always
+initialize the new bset when advancing b->written
+
+Signed-off-by: Kent Overstreet <kmo@daterainc.com>
+---
+ drivers/md/bcache/btree.h | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/md/bcache/btree.h b/drivers/md/bcache/btree.h
+index 3333d37..8a1c7e6 100644
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -353,7 +353,7 @@ static inline void rw_unlock(bool w, struct btree *b)
+ 		    _w == insert_lock(op, _b))				\
+ 			_r = bch_btree_ ## fn(_b, op, ##__VA_ARGS__);	\
+ 		rw_unlock(_w, _b);					\
+-		bch_cannibalize_unlock(c, &(op)->cl);		\
++		bch_cannibalize_unlock(c, &(op)->cl);			\
+ 	} while (_r == -EINTR);						\
+ 									\
+ 	_r;								\
+@@ -363,8 +363,7 @@ static inline bool should_split(struct btree *b)
+ {
+ 	struct bset *i = write_block(b);
+ 	return b->written >= btree_blocks(b) ||
+-		(i->seq == b->sets[0].data->seq &&
+-		 b->written + __set_blocks(i, i->keys + 15, b->c)
++		(b->written + __set_blocks(i, i->keys + 15, b->c)
+ 		 > btree_blocks(b));
+ }
+ 
+-- 
+2.6.2
+
