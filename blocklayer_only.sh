@@ -2,7 +2,7 @@
 
 dirs="crypto firmware init ipc net samples scripts security sound tools virt"
 
-arch_dirs="arc arm64 blackfin cris h8300 ia64 m68k microblaze mn10300 parisc s390 sh tile unicore32 alpha arm avr32 c6x frv hexagon m32r metag mips"
+arch_dirs="arc arm64 blackfin cris h8300 ia64 m68k microblaze mn10300 parisc s390 sh tile unicore32 alpha arm avr32 c6x frv hexagon m32r metag mips openrisc powerpc score sparc xtensa"
 
 drivers_dirs="accessibility acpi amba ata atm auxdisplay base bcma bluetooth bus cdrom char clk clocksource connector cpufreq cpuidle crypto dca devfreq edac disa extcon firewire firmware fmc gpio gpu hid hsi hv hwmon hwspinlock i2c ide idle iio infiniband input iommu ipack irqchip isdn leds lguest macintosh mailbox media memory memstick message mfd misc mmc mtd net nfc ntb nubus of oprofile parisc parport pci pcmcia pinctrl platform pnp power powercap pps ps3 ptp pwm rapidio regulator remoteproc reset rpmsg rtc s390 sbus sfi sh sn spi ssb staging target tc thermal tty uio usb uwb vfio vhost video virt virtio vlynq vme w1 watchdog xen zorro"
 
