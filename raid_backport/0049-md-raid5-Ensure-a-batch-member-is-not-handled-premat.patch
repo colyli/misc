@@ -1,0 +1,41 @@
+From b15a9dbdbfe72848b7ed4cd3f97fe80daaf99c89 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Fri, 22 May 2015 15:20:04 +1000
+Subject: [PATCH] md/raid5: Ensure a batch member is not handled prematurely.
+
+If a stripe is a member of a batch, but not the head, it must
+not be handled separately from the rest of the batch.
+
+'clear_batch_ready()' handles this requirement to some
+extent but not completely.  If a member is passed to handle_stripe()
+a second time it returns '0' indicating the stripe can be handled,
+which is wrong.
+So add an extra test.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ drivers/md/raid5.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 42d0ea6..e587367 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -4200,9 +4200,13 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
+ 
+ static int clear_batch_ready(struct stripe_head *sh)
+ {
++	/* Return '1' if this is a member of batch, or
++	 * '0' if it is a lone stripe or a head which can now be
++	 * handled.
++	 */
+ 	struct stripe_head *tmp;
+ 	if (!test_and_clear_bit(STRIPE_BATCH_READY, &sh->state))
+-		return 0;
++		return (sh->batch_head && sh->batch_head != sh);
+ 	spin_lock(&sh->stripe_lock);
+ 	if (!sh->batch_head) {
+ 		spin_unlock(&sh->stripe_lock);
+-- 
+2.6.2
+

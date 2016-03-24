@@ -1,0 +1,61 @@
+From ea358cd0d2c634ff1379a1392edcdf2289f31e13 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Fri, 12 Jun 2015 20:05:04 +1000
+Subject: [PATCH] md: make sure MD_RECOVERY_DONE is clear before starting
+ recovery/resync
+
+MD_RECOVERY_DONE is normally cleared by md_check_recovery after a
+resync etc finished.  However it is possible for raid5_start_reshape
+to race and start a reshape before MD_RECOVERY_DONE is cleared.  This
+can lean to multiple reshapes running at the same time, which isn't
+good.
+
+To make sure it is cleared before starting a reshape, and also clear
+it when reaping a thread, just to be safe.
+
+Signed-off-by: NeilBrown  <neilb@suse.de>
+---
+ drivers/md/md.c     | 1 +
+ drivers/md/raid10.c | 1 +
+ drivers/md/raid5.c  | 1 +
+ 3 files changed, 3 insertions(+)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 8d4408b..4dbed4a 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -8262,6 +8262,7 @@ void md_reap_sync_thread(struct mddev *mddev)
+ 	if (mddev_is_clustered(mddev))
+ 		md_cluster_ops->metadata_update_finish(mddev);
+ 	clear_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
++	clear_bit(MD_RECOVERY_DONE, &mddev->recovery);
+ 	clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+ 	clear_bit(MD_RECOVERY_RESHAPE, &mddev->recovery);
+ 	clear_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index e793ab6..f55c3f3 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -4156,6 +4156,7 @@ static int raid10_start_reshape(struct mddev *mddev)
+ 
+ 	clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+ 	clear_bit(MD_RECOVERY_CHECK, &mddev->recovery);
++	clear_bit(MD_RECOVERY_DONE, &mddev->recovery);
+ 	set_bit(MD_RECOVERY_RESHAPE, &mddev->recovery);
+ 	set_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
+ 
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 553d54b..b6793d2 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -7354,6 +7354,7 @@ static int raid5_start_reshape(struct mddev *mddev)
+ 
+ 	clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+ 	clear_bit(MD_RECOVERY_CHECK, &mddev->recovery);
++	clear_bit(MD_RECOVERY_DONE, &mddev->recovery);
+ 	set_bit(MD_RECOVERY_RESHAPE, &mddev->recovery);
+ 	set_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
+ 	mddev->sync_thread = md_register_thread(md_do_sync, mddev,
+-- 
+2.6.2
+

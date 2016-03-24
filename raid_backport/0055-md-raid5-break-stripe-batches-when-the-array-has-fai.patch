@@ -1,0 +1,28 @@
+From 626f2092c85ac847bb80b3257eb6a565dec32278 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Fri, 22 May 2015 14:03:10 +1000
+Subject: [PATCH] md/raid5: break stripe-batches when the array has failed.
+
+Once the array has too much failure, we need to break
+stripe-batches up so they can all be dealt with.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ drivers/md/raid5.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 3254504..553d54b 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -4337,6 +4337,7 @@ static void handle_stripe(struct stripe_head *sh)
+ 	if (s.failed > conf->max_degraded) {
+ 		sh->check_state = 0;
+ 		sh->reconstruct_state = 0;
++		break_stripe_batch_list(sh, 0);
+ 		if (s.to_read+s.to_write+s.written)
+ 			handle_failed_stripe(conf, sh, &s, disks, &s.return_bi);
+ 		if (s.syncing + s.replacing)
+-- 
+2.6.2
+

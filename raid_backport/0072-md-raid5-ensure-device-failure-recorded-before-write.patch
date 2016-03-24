@@ -1,0 +1,109 @@
+From c3cce6cda162eb2b2960a85d9c8992f4f3be85d0 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Fri, 14 Aug 2015 12:47:33 +1000
+Subject: [PATCH] md/raid5: ensure device failure recorded before write request
+ returns.
+
+When a write to one of the devices of a RAID5/6 fails, the failure is
+recorded in the metadata of the other devices so that after a restart
+the data on the failed drive wont be trusted even if that drive seems
+to be working again (maybe a cable was unplugged).
+
+Similarly when we record a bad-block in response to a write failure,
+we must not let the write complete until the bad-block update is safe.
+
+Currently there is no interlock between the write request completing
+and the metadata update.  So it is possible that the write will
+complete, the app will confirm success in some way, and then the
+machine will crash before the metadata update completes.
+
+This is an extremely small hole for a racy to fit in, but it is
+theoretically possible and so should be closed.
+
+So:
+ - set MD_CHANGE_PENDING when requesting a metadata update for a
+   failed device, so we can know with certainty when it completes
+ - queue requests that completed when MD_CHANGE_PENDING is set to
+   only be processed after the metadata update completes
+ - call raid_end_bio_io() on bios in that queue when the time comes.
+
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+---
+ drivers/md/raid5.c | 24 +++++++++++++++++++++++-
+ drivers/md/raid5.h |  3 +++
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 214dcca..4195064 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -2513,6 +2513,7 @@ static void error(struct mddev *mddev, struct md_rdev *rdev)
+ 	set_bit(Blocked, &rdev->flags);
+ 	set_bit(Faulty, &rdev->flags);
+ 	set_bit(MD_CHANGE_DEVS, &mddev->flags);
++	set_bit(MD_CHANGE_PENDING, &mddev->flags);
+ 	printk(KERN_ALERT
+ 	       "md/raid:%s: Disk failure on %s, disabling device.\n"
+ 	       "md/raid:%s: Operation continuing on %d devices.\n",
+@@ -4601,7 +4602,15 @@ finish:
+ 			md_wakeup_thread(conf->mddev->thread);
+ 	}
+ 
+-	return_io(&s.return_bi);
++	if (!bio_list_empty(&s.return_bi)) {
++		if (test_bit(MD_CHANGE_PENDING, &conf->mddev->flags)) {
++			spin_lock_irq(&conf->device_lock);
++			bio_list_merge(&conf->return_bi, &s.return_bi);
++			spin_unlock_irq(&conf->device_lock);
++			md_wakeup_thread(conf->mddev->thread);
++		} else
++			return_io(&s.return_bi);
++	}
+ 
+ 	clear_bit_unlock(STRIPE_ACTIVE, &sh->state);
+ }
+@@ -5817,6 +5826,18 @@ static void raid5d(struct md_thread *thread)
+ 
+ 	md_check_recovery(mddev);
+ 
++	if (!bio_list_empty(&conf->return_bi) &&
++	    !test_bit(MD_CHANGE_PENDING, &mddev->flags)) {
++		struct bio_list tmp = BIO_EMPTY_LIST;
++		spin_lock_irq(&conf->device_lock);
++		if (!test_bit(MD_CHANGE_PENDING, &mddev->flags)) {
++			bio_list_merge(&tmp, &conf->return_bi);
++			bio_list_init(&conf->return_bi);
++		}
++		spin_unlock_irq(&conf->device_lock);
++		return_io(&tmp);
++	}
++
+ 	blk_start_plug(&plug);
+ 	handled = 0;
+ 	spin_lock_irq(&conf->device_lock);
+@@ -6476,6 +6497,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
+ 	INIT_LIST_HEAD(&conf->hold_list);
+ 	INIT_LIST_HEAD(&conf->delayed_list);
+ 	INIT_LIST_HEAD(&conf->bitmap_list);
++	bio_list_init(&conf->return_bi);
+ 	init_llist_head(&conf->released_stripes);
+ 	atomic_set(&conf->active_stripes, 0);
+ 	atomic_set(&conf->preread_active_stripes, 0);
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 1de82a6e..828c292 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -476,6 +476,9 @@ struct r5conf {
+ 	int			skip_copy; /* Don't copy data from bio to stripe cache */
+ 	struct list_head	*last_hold; /* detect hold_list promotions */
+ 
++	/* bios to have bi_end_io called after metadata is synced */
++	struct bio_list		return_bi;
++
+ 	atomic_t		reshape_stripes; /* stripes with pending writes for reshape */
+ 	/* unfortunately we need two cache names as we temporarily have
+ 	 * two caches.
+-- 
+2.6.2
+

@@ -1,0 +1,77 @@
+From 6d183de4077191d1201283a9035ce57a9b05254d Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Thu, 28 Nov 2013 10:55:27 +1100
+Subject: [PATCH] md/raid5: fix newly-broken locking in get_active_stripe.
+
+commit 566c09c53455d7c4f1 raid5: relieve lock contention in get_active_stripe()
+
+modified the locking in get_active_stripe() reducing the range
+protected by the (highly contended) device_lock.
+Unfortunately it reduced the range too much opening up some races.
+
+One race can occur if get_priority_stripe runs between the
+test on sh->count and device_lock being taken.
+This will mean that sh->lru is not empty while get_active_stripe
+thinks ->count is zero resulting in a 'BUG' firing.
+
+Another race happens if __release_stripe is called immediately
+after sh->count is tested and found to be non-zero.  If STRIPE_HANDLE
+is not set, get_active_stripe should increment ->active_stripes
+when it increments ->count from 0, but as it didn't think it was 0,
+it doesn't.
+
+Extending device_lock to cover the test on sh->count close these
+races.
+
+While we are here, fix the two BUG tests:
+ -If count is zero, then lru really must not be empty, or we've
+  lock the stripe_head somehow - no other tests are relevant.
+ -STRIPE_ON_RELEASE_LIST is completely independent of ->lru so
+  testing it is pointless.
+
+Reported-and-tested-by: Brassow Jonathan <jbrassow@redhat.com>
+Reviewed-by: Shaohua Li <shli@kernel.org>
+Fixes: 566c09c53455d7c4f1
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ drivers/md/raid5.c | 11 ++++-------
+ 1 file changed, 4 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 676d8b7..cc055da 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -678,26 +678,23 @@ get_active_stripe(struct r5conf *conf, sector_t sector,
+ 			} else
+ 				init_stripe(sh, sector, previous);
+ 		} else {
++			spin_lock(&conf->device_lock);
+ 			if (atomic_read(&sh->count)) {
+ 				BUG_ON(!list_empty(&sh->lru)
+ 				    && !test_bit(STRIPE_EXPANDING, &sh->state)
+ 				    && !test_bit(STRIPE_ON_UNPLUG_LIST, &sh->state)
+-				    && !test_bit(STRIPE_ON_RELEASE_LIST, &sh->state));
++					);
+ 			} else {
+-				spin_lock(&conf->device_lock);
+ 				if (!test_bit(STRIPE_HANDLE, &sh->state))
+ 					atomic_inc(&conf->active_stripes);
+-				if (list_empty(&sh->lru) &&
+-				    !test_bit(STRIPE_ON_RELEASE_LIST, &sh->state) &&
+-				    !test_bit(STRIPE_EXPANDING, &sh->state))
+-					BUG();
++				BUG_ON(list_empty(&sh->lru));
+ 				list_del_init(&sh->lru);
+ 				if (sh->group) {
+ 					sh->group->stripes_cnt--;
+ 					sh->group = NULL;
+ 				}
+-				spin_unlock(&conf->device_lock);
+ 			}
++			spin_unlock(&conf->device_lock);
+ 		}
+ 	} while (sh == NULL);
+ 
+-- 
+2.6.2
+

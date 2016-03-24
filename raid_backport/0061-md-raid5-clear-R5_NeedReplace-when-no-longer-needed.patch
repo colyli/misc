@@ -1,0 +1,36 @@
+From e6030cb06c40e4ab4e8c712f13f494a09638ed2c Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Fri, 17 Jul 2015 13:26:23 +1000
+Subject: [PATCH] md/raid5: clear R5_NeedReplace when no longer needed.
+
+This flag is currently never cleared, which can in rare cases
+trigger a warn-on if it is still set but the block isn't
+InSync.
+
+So clear it when it isn't need, which includes if the replacement
+device has failed.
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+---
+ drivers/md/raid5.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 38300ee..643d217 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -4066,8 +4066,10 @@ static void analyse_stripe(struct stripe_head *sh, struct stripe_head_state *s)
+ 				 &first_bad, &bad_sectors))
+ 			set_bit(R5_ReadRepl, &dev->flags);
+ 		else {
+-			if (rdev)
++			if (rdev && !test_bit(Faulty, &rdev->flags))
+ 				set_bit(R5_NeedReplace, &dev->flags);
++			else
++				clear_bit(R5_NeedReplace, &dev->flags);
+ 			rdev = rcu_dereference(conf->disks[i].rdev);
+ 			clear_bit(R5_ReadRepl, &dev->flags);
+ 		}
+-- 
+2.6.2
+

@@ -1,0 +1,39 @@
+From 053f5b6525ae32da397e6c47721961f800d2c924 Mon Sep 17 00:00:00 2001
+From: Eivind Sarto <eivindsarto@gmail.com>
+Date: Mon, 9 Jun 2014 17:06:19 -0700
+Subject: [PATCH] raid5: speedup sync_request processing
+
+The raid5 sync_request() processing calls handle_stripe() within the context of
+the resync-thread.  The resync-thread issues the first set of read requests
+and this adds execution latency and slows down the scheduling of the next
+sync_request().
+The current rebuild/resync speed of raid5 is not much faster than what
+rotational HDDs can sustain.
+Testing the following patch on a 6-drive array, I can increase the rebuild
+speed from 100 MB/s to 175 MB/s.
+The sync_request() now just sets STRIPE_HANDLE and releases the stripe.  This
+creates some more parallelism between the resync-thread and raid5 kernel daemon.
+
+Signed-off-by: Eivind Sarto <esarto@fusionio.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ drivers/md/raid5.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index ce421e3..28219fa 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5074,8 +5074,8 @@ static inline sector_t sync_request(struct mddev *mddev, sector_t sector_nr, int
+ 	bitmap_start_sync(mddev->bitmap, sector_nr, &sync_blocks, still_degraded);
+ 
+ 	set_bit(STRIPE_SYNC_REQUESTED, &sh->state);
++	set_bit(STRIPE_HANDLE, &sh->state);
+ 
+-	handle_stripe(sh);
+ 	release_stripe(sh);
+ 
+ 	return STRIPE_SECTORS;
+-- 
+2.6.2
+

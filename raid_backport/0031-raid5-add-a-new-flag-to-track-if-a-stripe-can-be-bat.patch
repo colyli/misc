@@ -1,0 +1,88 @@
+From da41ba65972532a04f73927c903029a7ec3bc2ed Mon Sep 17 00:00:00 2001
+From: "shli@kernel.org" <shli@kernel.org>
+Date: Mon, 15 Dec 2014 12:57:03 +1100
+Subject: [PATCH] raid5: add a new flag to track if a stripe can be batched
+
+A freshly new stripe with write request can be batched. Any time the stripe is
+handled or new read is queued, the flag will be cleared.
+
+Signed-off-by: Shaohua Li <shli@fusionio.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ drivers/md/raid5.c | 12 +++++++++---
+ drivers/md/raid5.h |  1 +
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 7fb510e..49b0f23 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -555,6 +555,7 @@ retry:
+ 		goto retry;
+ 	insert_hash(conf, sh);
+ 	sh->cpu = smp_processor_id();
++	set_bit(STRIPE_BATCH_READY, &sh->state);
+ }
+ 
+ static struct stripe_head *__find_stripe(struct r5conf *conf, sector_t sector,
+@@ -2645,7 +2646,8 @@ schedule_reconstruction(struct stripe_head *sh, struct stripe_head_state *s,
+  * toread/towrite point to the first in a chain.
+  * The bi_next chain must be in order.
+  */
+-static int add_stripe_bio(struct stripe_head *sh, struct bio *bi, int dd_idx, int forwrite)
++static int add_stripe_bio(struct stripe_head *sh, struct bio *bi, int dd_idx,
++			  int forwrite, int previous)
+ {
+ 	struct bio **bip;
+ 	struct r5conf *conf = sh->raid_conf;
+@@ -2678,6 +2680,9 @@ static int add_stripe_bio(struct stripe_head *sh, struct bio *bi, int dd_idx, in
+ 	if (*bip && (*bip)->bi_iter.bi_sector < bio_end_sector(bi))
+ 		goto overlap;
+ 
++	if (!forwrite || previous)
++		clear_bit(STRIPE_BATCH_READY, &sh->state);
++
+ 	BUG_ON(*bip && bi->bi_next && (*bip) != bi->bi_next);
+ 	if (*bip)
+ 		bi->bi_next = *bip;
+@@ -3824,6 +3829,7 @@ static void handle_stripe(struct stripe_head *sh)
+ 		return;
+ 	}
+ 
++	clear_bit(STRIPE_BATCH_READY, &sh->state);
+ 	if (test_bit(STRIPE_SYNC_REQUESTED, &sh->state)) {
+ 		spin_lock(&sh->stripe_lock);
+ 		/* Cannot process 'sync' concurrently with 'discard' */
+@@ -4793,7 +4799,7 @@ static void make_request(struct mddev *mddev, struct bio * bi)
+ 			}
+ 
+ 			if (test_bit(STRIPE_EXPANDING, &sh->state) ||
+-			    !add_stripe_bio(sh, bi, dd_idx, rw)) {
++			    !add_stripe_bio(sh, bi, dd_idx, rw, previous)) {
+ 				/* Stripe is busy expanding or
+ 				 * add failed due to overlap.  Flush everything
+ 				 * and wait a while
+@@ -5206,7 +5212,7 @@ static int  retry_aligned_read(struct r5conf *conf, struct bio *raid_bio)
+ 			return handled;
+ 		}
+ 
+-		if (!add_stripe_bio(sh, raid_bio, dd_idx, 0)) {
++		if (!add_stripe_bio(sh, raid_bio, dd_idx, 0, 0)) {
+ 			release_stripe(sh);
+ 			raid5_set_bi_processed_stripes(raid_bio, scnt);
+ 			conf->retry_read_aligned = raid_bio;
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 1d0f241..37644e3 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -327,6 +327,7 @@ enum {
+ 	STRIPE_ON_UNPLUG_LIST,
+ 	STRIPE_DISCARD,
+ 	STRIPE_ON_RELEASE_LIST,
++	STRIPE_BATCH_READY,
+ };
+ 
+ /*
+-- 
+2.6.2
+

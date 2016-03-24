@@ -1,0 +1,77 @@
+From 3fd83717e47687817f5d3e45696bf22456d8b422 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Sat, 23 Aug 2014 20:19:26 +1000
+Subject: [PATCH] md: use set_bit/clear_bit instead of shift/mask for bi_flags
+ changes.
+
+Using {set,clear}_bit is more consistent than shifting and masking.
+
+No functional change.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ drivers/md/raid1.c  | 2 +-
+ drivers/md/raid10.c | 6 +++---
+ drivers/md/raid5.c  | 2 +-
+ 3 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index 0111ff3..019aa18 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -2722,7 +2722,7 @@ static sector_t sync_request(struct mddev *mddev, sector_t sector_nr, int *skipp
+ 						/* remove last page from this bio */
+ 						bio->bi_vcnt--;
+ 						bio->bi_iter.bi_size -= len;
+-						bio->bi_flags &= ~(1<< BIO_SEG_VALID);
++						__clear_bit(BIO_SEG_VALID, &bio->bi_flags);
+ 					}
+ 					goto bio_full;
+ 				}
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 6703751..a2788bc 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -3388,7 +3388,7 @@ static sector_t sync_request(struct mddev *mddev, sector_t sector_nr,
+ 				/* remove last page from this bio */
+ 				bio2->bi_vcnt--;
+ 				bio2->bi_iter.bi_size -= len;
+-				bio2->bi_flags &= ~(1<< BIO_SEG_VALID);
++				__clear_bit(BIO_SEG_VALID, &bio2->bi_flags);
+ 			}
+ 			goto bio_full;
+ 		}
+@@ -4416,7 +4416,7 @@ read_more:
+ 	read_bio->bi_end_io = end_sync_read;
+ 	read_bio->bi_rw = READ;
+ 	read_bio->bi_flags &= (~0UL << BIO_RESET_BITS);
+-	read_bio->bi_flags |= 1 << BIO_UPTODATE;
++	__set_bit(BIO_UPTODATE, &read_bio->bi_flags);
+ 	read_bio->bi_vcnt = 0;
+ 	read_bio->bi_iter.bi_size = 0;
+ 	r10_bio->master_bio = read_bio;
+@@ -4473,7 +4473,7 @@ read_more:
+ 				/* Remove last page from this bio */
+ 				bio2->bi_vcnt--;
+ 				bio2->bi_iter.bi_size -= len;
+-				bio2->bi_flags &= ~(1<<BIO_SEG_VALID);
++				__clear_bit(BIO_SEG_VALID, &bio2->bi_flags);
+ 			}
+ 			goto bio_full;
+ 		}
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 9f0fbec..b177cc4 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -4301,7 +4301,7 @@ static int chunk_aligned_read(struct mddev *mddev, struct bio * raid_bio)
+ 		rcu_read_unlock();
+ 		raid_bio->bi_next = (void*)rdev;
+ 		align_bi->bi_bdev =  rdev->bdev;
+-		align_bi->bi_flags &= ~(1 << BIO_SEG_VALID);
++		__clear_bit(BIO_SEG_VALID, &align_bi->bi_flags);
+ 
+ 		if (!bio_fits_rdev(align_bi) ||
+ 		    is_badblock(rdev, align_bi->bi_iter.bi_sector,
+-- 
+2.6.2
+

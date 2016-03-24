@@ -1,0 +1,79 @@
+From fb642b92c267beeefd352af9bc461eac93a7552c Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Thu, 21 May 2015 12:00:47 +1000
+Subject: [PATCH] md/raid5: duplicate some more handle_stripe_clean_event code
+ in break_stripe_batch_list
+
+break_stripe_batch list didn't clear head_sh->batch_head.
+This was probably a bug.
+
+Also clear all R5_Overlap flags and if any were cleared, wake up
+'wait_for_overlap'.
+This isn't always necessary but the worst effect is a little
+extra checking for code that is waiting on wait_for_overlap.
+
+Also, don't use wake_up_nr() because that does the wrong thing
+if 'nr' is zero, and it number of flags cleared doesn't
+strongly correlate with the number of threads to wake.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ drivers/md/raid5.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index fc5c403..6de2e1e 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -3557,7 +3557,8 @@ unhash:
+ 	spin_lock_irq(&head_sh->stripe_lock);
+ 	head_sh->batch_head = NULL;
+ 	spin_unlock_irq(&head_sh->stripe_lock);
+-	wake_up_nr(&conf->wait_for_overlap, wakeup_nr);
++	if (wakeup_nr)
++		wake_up(&conf->wait_for_overlap);
+ 	if (head_sh->state & STRIPE_EXPAND_SYNC_FLAG)
+ 		set_bit(STRIPE_HANDLE, &head_sh->state);
+ }
+@@ -4238,6 +4239,7 @@ static void break_stripe_batch_list(struct stripe_head *head_sh)
+ {
+ 	struct stripe_head *sh, *next;
+ 	int i;
++	int do_wakeup = 0;
+ 
+ 	list_for_each_entry_safe(sh, next, &head_sh->batch_list, batch_list) {
+ 
+@@ -4250,10 +4252,12 @@ static void break_stripe_batch_list(struct stripe_head *head_sh)
+ 						 STRIPE_EXPAND_SYNC_FLAG));
+ 		sh->check_state = head_sh->check_state;
+ 		sh->reconstruct_state = head_sh->reconstruct_state;
+-		for (i = 0; i < sh->disks; i++)
++		for (i = 0; i < sh->disks; i++) {
++			if (test_and_clear_bit(R5_Overlap, &sh->dev[i].flags))
++				do_wakeup = 1;
+ 			sh->dev[i].flags = head_sh->dev[i].flags &
+ 				(~((1 << R5_WriteError) | (1 << R5_Overlap)));
+-
++		}
+ 		spin_lock_irq(&sh->stripe_lock);
+ 		sh->batch_head = NULL;
+ 		spin_unlock_irq(&sh->stripe_lock);
+@@ -4261,6 +4265,15 @@ static void break_stripe_batch_list(struct stripe_head *head_sh)
+ 		set_bit(STRIPE_HANDLE, &sh->state);
+ 		release_stripe(sh);
+ 	}
++	spin_lock_irq(&head_sh->stripe_lock);
++	head_sh->batch_head = NULL;
++	spin_unlock_irq(&head_sh->stripe_lock);
++	for (i = 0; i < head_sh->disks; i++)
++		if (test_and_clear_bit(R5_Overlap, &head_sh->dev[i].flags))
++			do_wakeup = 1;
++
++	if (do_wakeup)
++		wake_up(&head_sh->raid_conf->wait_for_overlap);
+ }
+ 
+ static void handle_stripe(struct stripe_head *sh)
+-- 
+2.6.2
+
