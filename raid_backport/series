@@ -62,7 +62,7 @@ patches.raid5perf/0059-md-raid5-ignore-released_stripes-check.patch
 patches.raid5perf/0060-md-raid5-avoid-races-when-changing-cache-size.patch
 patches.raid5perf/0061-md-raid5-clear-R5_NeedReplace-when-no-longer-needed.patch
 patches.raid5perf/0062-md-raid5-don-t-let-shrink_slab-shrink-too-far.patch
-patches.raid5perf/0063-md-raid5-split-bio-for-chunk_aligned_read.patch
+#patches.raid5perf/0063-md-raid5-split-bio-for-chunk_aligned_read.patch
 patches.raid5perf/0064-md-raid5-consider-updating-reshape_position-at-start.patch
 patches.raid5perf/0065-md-raid5-always-set-conf-prev_chunk_sectors-and-prev.patch
 patches.raid5perf/0066-md-raid5-switch-to-use-conf-chunk_sectors-in-place-o.patch
