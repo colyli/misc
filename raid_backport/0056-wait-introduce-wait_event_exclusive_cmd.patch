@@ -29,8 +29,10 @@ Date:   Fri May 8 18:19:05 2015 +1000
  include/linux/wait.h |   30 ++++++++++++++++++++++++++++++
  1 file changed, 30 insertions(+)
 
---- a/include/linux/wait.h
-+++ b/include/linux/wait.h
+Index: linux-3.12-SLE12-SP1/include/linux/wait.h
+===================================================================
+--- linux-3.12-SLE12-SP1.orig/include/linux/wait.h
++++ linux-3.12-SLE12-SP1/include/linux/wait.h
 @@ -199,6 +199,10 @@ do {									\
  	finish_wait(&wq, &__wait);					\
  } while (0)
@@ -59,7 +61,7 @@ Date:   Fri May 8 18:19:05 2015 +1000
 +		prepare_to_wait(&wq, &__wait, __state);			\
 +		if (condition)						\
 +			break;						\
-+		if (___wait_is_interruptible(state) &&			\
++		if (___wait_is_interruptible(__state) &&			\
 +		    signal_pending_state(__state, current)) {		\
 +			abort_exclusive_wait(&wq, &__wait,		\
 +					     __state, NULL);		\

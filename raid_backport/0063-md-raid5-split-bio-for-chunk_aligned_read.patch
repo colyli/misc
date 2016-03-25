@@ -21,14 +21,12 @@ Acked-by: NeilBrown <neilb@suse.de>
 Signed-off-by: Ming Lin <ming.l@ssi.samsung.com>
 Signed-off-by: Jens Axboe <axboe@fb.com>
 ---
- drivers/md/raid5.c | 37 ++++++++++++++++++++++++++++++++-----
+ drivers/md/raid5.c |   37 ++++++++++++++++++++++++++++++++-----
  1 file changed, 32 insertions(+), 5 deletions(-)
 
-diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
-index 085db93..256cc07 100644
 --- a/drivers/md/raid5.c
 +++ b/drivers/md/raid5.c
-@@ -4800,7 +4800,7 @@ static int bio_fits_rdev(struct bio *bi)
+@@ -4769,7 +4769,7 @@ static int bio_fits_rdev(struct bio *bi)
  	return 1;
  }
  
@@ -37,7 +35,7 @@ index 085db93..256cc07 100644
  {
  	struct r5conf *conf = mddev->private;
  	int dd_idx;
-@@ -4809,7 +4809,7 @@ static int chunk_aligned_read(struct mddev *mddev, struct bio * raid_bio)
+@@ -4778,7 +4778,7 @@ static int chunk_aligned_read(struct mdd
  	sector_t end_sector;
  
  	if (!in_chunk_boundary(mddev, raid_bio)) {
@@ -46,7 +44,7 @@ index 085db93..256cc07 100644
  		return 0;
  	}
  	/*
-@@ -4886,6 +4886,31 @@ static int chunk_aligned_read(struct mddev *mddev, struct bio * raid_bio)
+@@ -4854,6 +4854,31 @@ static int chunk_aligned_read(struct mdd
  	}
  }
  
@@ -55,7 +53,7 @@ index 085db93..256cc07 100644
 +	struct bio *split;
 +
 +	do {
-+		sector_t sector = raid_bio->bi_iter.bi_sector;
++		sector_t sector = raid_bio->bi_sector;
 +		unsigned chunk_sects = mddev->chunk_sectors;
 +		unsigned sectors = chunk_sects - (sector & (chunk_sects-1));
 +
@@ -78,7 +76,7 @@ index 085db93..256cc07 100644
  /* __get_priority_stripe - get the next stripe to process
   *
   * Full stripe writes are allowed to pass preread active stripes up until
-@@ -5163,9 +5188,11 @@ static void make_request(struct mddev *mddev, struct bio * bi)
+@@ -5131,9 +5156,11 @@ static void make_request(struct mddev *m
  	 * data on failed drives.
  	 */
  	if (rw == READ && mddev->degraded == 0 &&
@@ -93,6 +91,3 @@ index 085db93..256cc07 100644
  
  	if (unlikely(bi->bi_rw & REQ_DISCARD)) {
  		make_discard_request(mddev, bi);
--- 
-2.6.2
-
