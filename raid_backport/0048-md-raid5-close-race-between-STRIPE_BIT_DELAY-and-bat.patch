@@ -19,15 +19,13 @@ extra delay of the stripe is needed.
 Reported-by: Shaohua Li <shli@kernel.org>
 Signed-off-by: NeilBrown <neilb@suse.de>
 ---
- drivers/md/raid5.c | 25 ++++++++++++++++++++++---
- drivers/md/raid5.h |  3 +++
+ drivers/md/raid5.c |   25 ++++++++++++++++++++++---
+ drivers/md/raid5.h |    3 +++
  2 files changed, 25 insertions(+), 3 deletions(-)
 
-diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
-index c55a68f..42d0ea6 100644
 --- a/drivers/md/raid5.c
 +++ b/drivers/md/raid5.c
-@@ -749,6 +749,7 @@ static void unlock_two_stripes(struct stripe_head *sh1, struct stripe_head *sh2)
+@@ -748,6 +748,7 @@ static void unlock_two_stripes(struct st
  static bool stripe_can_batch(struct stripe_head *sh)
  {
  	return test_bit(STRIPE_BATCH_READY, &sh->state) &&
@@ -35,9 +33,9 @@ index c55a68f..42d0ea6 100644
  		is_full_stripe_write(sh);
  }
  
-@@ -2996,14 +2997,32 @@ static int add_stripe_bio(struct stripe_head *sh, struct bio *bi, int dd_idx,
+@@ -2949,14 +2950,32 @@ static int add_stripe_bio(struct stripe_
  	pr_debug("added bi b#%llu to stripe s#%llu, disk %d.\n",
- 		(unsigned long long)(*bip)->bi_iter.bi_sector,
+ 		(unsigned long long)(*bip)->bi_sector,
  		(unsigned long long)sh->sector, dd_idx);
 -	spin_unlock_irq(&sh->stripe_lock);
  
@@ -71,8 +69,6 @@ index c55a68f..42d0ea6 100644
  
  	if (stripe_can_batch(sh))
  		stripe_add_to_batch_list(conf, sh);
-diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
-index 7dc0dd8..01cdb9f 100644
 --- a/drivers/md/raid5.h
 +++ b/drivers/md/raid5.h
 @@ -337,6 +337,9 @@ enum {
@@ -85,6 +81,3 @@ index 7dc0dd8..01cdb9f 100644
  };
  
  #define STRIPE_EXPAND_SYNC_FLAG \
--- 
-2.6.2
-

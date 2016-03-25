@@ -12,14 +12,12 @@ hot code path for such workload. Unfortunately we must delete the BUG_ON.
 Signed-off-by: Shaohua Li <shli@fusionio.com>
 Signed-off-by: NeilBrown <neilb@suse.de>
 ---
- drivers/md/raid5.c | 9 ++-------
+ drivers/md/raid5.c |    9 ++-------
  1 file changed, 2 insertions(+), 7 deletions(-)
 
-diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
-index a904a2c..25247a8 100644
 --- a/drivers/md/raid5.c
 +++ b/drivers/md/raid5.c
-@@ -679,14 +679,9 @@ get_active_stripe(struct r5conf *conf, sector_t sector,
+@@ -683,14 +683,9 @@ get_active_stripe(struct r5conf *conf, s
  				init_stripe(sh, sector, previous);
  				atomic_inc(&sh->count);
  			}
@@ -35,7 +33,4 @@ index a904a2c..25247a8 100644
 +			if (!atomic_read(&sh->count)) {
  				if (!test_bit(STRIPE_HANDLE, &sh->state))
  					atomic_inc(&conf->active_stripes);
- 				BUG_ON(list_empty(&sh->lru) &&
--- 
-2.6.2
-
+ 				BUG_ON(list_empty(&sh->lru));

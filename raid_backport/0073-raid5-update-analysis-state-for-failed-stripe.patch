@@ -14,23 +14,21 @@ handle_failed_stripe()
 Signed-off-by: Shaohua Li <shli@fb.com>
 Signed-off-by: NeilBrown <neilb@suse.com>
 ---
- drivers/md/raid5.c | 4 ++++
+ drivers/md/raid5.c |    4 ++++
  1 file changed, 4 insertions(+)
 
-diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
-index 15ef2c6..2105e5f 100644
 --- a/drivers/md/raid5.c
 +++ b/drivers/md/raid5.c
-@@ -3150,6 +3150,8 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
+@@ -3103,6 +3103,8 @@ handle_failed_stripe(struct r5conf *conf
  			spin_unlock_irq(&sh->stripe_lock);
  			if (test_and_clear_bit(R5_Overlap, &sh->dev[i].flags))
  				wake_up(&conf->wait_for_overlap);
 +			if (bi)
 +				s->to_read--;
- 			while (bi && bi->bi_iter.bi_sector <
+ 			while (bi && bi->bi_sector <
  			       sh->dev[i].sector + STRIPE_SECTORS) {
  				struct bio *nextbi =
-@@ -3169,6 +3171,8 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
+@@ -3121,6 +3123,8 @@ handle_failed_stripe(struct r5conf *conf
  		 */
  		clear_bit(R5_LOCKED, &sh->dev[i].flags);
  	}
@@ -39,6 +37,3 @@ index 15ef2c6..2105e5f 100644
  
  	if (test_and_clear_bit(STRIPE_FULL_WRITE, &sh->state))
  		if (atomic_dec_and_test(&conf->pending_full_writes))
--- 
-2.6.2
-

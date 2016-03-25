@@ -28,18 +28,18 @@ Neilb:
   changed BUG_ON to WARN_ON
   Removed some assignments from raid5_build_block which are now not needed.
 
+(colyli: rebase the patch to remove confliction in async_copy_data)
+
 Signed-off-by: Shaohua Li <shli@fusionio.com>
 Signed-off-by: NeilBrown <neilb@suse.de>
 ---
- drivers/md/raid5.c | 119 +++++++++++++++++++++++++++++++++++++++++++----------
- drivers/md/raid5.h |   4 +-
+ drivers/md/raid5.c |  119 +++++++++++++++++++++++++++++++++++++++++++----------
+ drivers/md/raid5.h |    4 +
  2 files changed, 101 insertions(+), 22 deletions(-)
 
-diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
-index 348a857..d69fd98 100644
 --- a/drivers/md/raid5.c
 +++ b/drivers/md/raid5.c
-@@ -487,6 +487,7 @@ static void shrink_buffers(struct stripe_head *sh)
+@@ -491,6 +491,7 @@ static void shrink_buffers(struct stripe
  	int num = sh->raid_conf->pool_size;
  
  	for (i = 0; i < num ; i++) {
@@ -47,7 +47,7 @@ index 348a857..d69fd98 100644
  		p = sh->dev[i].page;
  		if (!p)
  			continue;
-@@ -507,6 +508,7 @@ static int grow_buffers(struct stripe_head *sh)
+@@ -511,6 +512,7 @@ static int grow_buffers(struct stripe_he
  			return 1;
  		}
  		sh->dev[i].page = page;
@@ -55,7 +55,7 @@ index 348a857..d69fd98 100644
  	}
  	return 0;
  }
-@@ -863,6 +865,9 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+@@ -866,6 +868,9 @@ static void ops_run_io(struct stripe_hea
  			if (test_bit(R5_ReadNoMerge, &sh->dev[i].flags))
  				bi->bi_rw |= REQ_NOMERGE;
  
@@ -65,9 +65,9 @@ index 348a857..d69fd98 100644
  			bi->bi_vcnt = 1;
  			bi->bi_io_vec[0].bv_len = STRIPE_SIZE;
  			bi->bi_io_vec[0].bv_offset = 0;
-@@ -907,6 +912,9 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+@@ -910,6 +915,9 @@ static void ops_run_io(struct stripe_hea
  			else
- 				rbi->bi_iter.bi_sector = (sh->sector
+ 				rbi->bi_sector = (sh->sector
  						  + rrdev->data_offset);
 +			if (test_bit(R5_SkipCopy, &sh->dev[i].flags))
 +				WARN_ON(test_bit(R5_UPTODATE, &sh->dev[i].flags));
@@ -75,7 +75,7 @@ index 348a857..d69fd98 100644
  			rbi->bi_vcnt = 1;
  			rbi->bi_io_vec[0].bv_len = STRIPE_SIZE;
  			rbi->bi_io_vec[0].bv_offset = 0;
-@@ -935,8 +943,9 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+@@ -938,8 +946,9 @@ static void ops_run_io(struct stripe_hea
  }
  
  static struct dma_async_tx_descriptor *
@@ -85,12 +85,12 @@ index 348a857..d69fd98 100644
 +	sector_t sector, struct dma_async_tx_descriptor *tx,
 +	struct stripe_head *sh)
  {
- 	struct bio_vec bvl;
- 	struct bvec_iter iter;
-@@ -973,11 +982,16 @@ async_copy_data(int frombio, struct bio *bio, struct page *page,
+ 	struct bio_vec *bvl;
+ 	struct page *bio_page;
+@@ -976,11 +985,16 @@ async_copy_data(int frombio, struct bio
  		if (clen > 0) {
- 			b_offset += bvl.bv_offset;
- 			bio_page = bvl.bv_page;
+ 			b_offset += bvl->bv_offset;
+ 			bio_page = bvl->bv_page;
 -			if (frombio)
 -				tx = async_memcpy(page, bio_page, page_offset,
 +			if (frombio) {
@@ -108,9 +108,9 @@ index 348a857..d69fd98 100644
  						  page_offset, clen, &submit);
  		}
  		/* chain the operations */
-@@ -1053,8 +1067,8 @@ static void ops_run_biofill(struct stripe_head *sh)
+@@ -1056,8 +1070,8 @@ static void ops_run_biofill(struct strip
  			spin_unlock_irq(&sh->stripe_lock);
- 			while (rbi && rbi->bi_iter.bi_sector <
+ 			while (rbi && rbi->bi_sector <
  				dev->sector + STRIPE_SECTORS) {
 -				tx = async_copy_data(0, rbi, dev->page,
 -					dev->sector, tx);
@@ -119,15 +119,15 @@ index 348a857..d69fd98 100644
  				rbi = r5_next_bio(rbi, dev->sector);
  			}
  		}
-@@ -1392,6 +1406,7 @@ ops_run_biodrain(struct stripe_head *sh, struct dma_async_tx_descriptor *tx)
+@@ -1395,6 +1409,7 @@ ops_run_biodrain(struct stripe_head *sh,
  			BUG_ON(dev->written);
  			wbi = dev->written = chosen;
  			spin_unlock_irq(&sh->stripe_lock);
 +			WARN_ON(dev->page != dev->orig_page);
  
- 			while (wbi && wbi->bi_iter.bi_sector <
+ 			while (wbi && wbi->bi_sector <
  				dev->sector + STRIPE_SECTORS) {
-@@ -1401,9 +1416,15 @@ ops_run_biodrain(struct stripe_head *sh, struct dma_async_tx_descriptor *tx)
+@@ -1404,9 +1419,15 @@ ops_run_biodrain(struct stripe_head *sh,
  					set_bit(R5_SyncIO, &dev->flags);
  				if (wbi->bi_rw & REQ_DISCARD)
  					set_bit(R5_Discard, &dev->flags);
@@ -146,7 +146,7 @@ index 348a857..d69fd98 100644
  				wbi = r5_next_bio(wbi, dev->sector);
  			}
  		}
-@@ -1434,7 +1455,7 @@ static void ops_complete_reconstruct(void *stripe_head_ref)
+@@ -1437,7 +1458,7 @@ static void ops_complete_reconstruct(voi
  		struct r5dev *dev = &sh->dev[i];
  
  		if (dev->written || i == pd_idx || i == qd_idx) {
@@ -155,7 +155,7 @@ index 348a857..d69fd98 100644
  				set_bit(R5_UPTODATE, &dev->flags);
  			if (fua)
  				set_bit(R5_WantFUA, &dev->flags);
-@@ -1847,8 +1868,10 @@ static int resize_stripes(struct r5conf *conf, int newsize)
+@@ -1850,8 +1871,10 @@ static int resize_stripes(struct r5conf
  		osh = get_free_stripe(conf, hash);
  		unlock_device_hash_lock(conf, hash);
  		atomic_set(&nsh->count, 1);
@@ -167,7 +167,7 @@ index 348a857..d69fd98 100644
  		for( ; i<newsize; i++)
  			nsh->dev[i].page = NULL;
  		nsh->hash_lock_index = hash;
-@@ -1904,6 +1927,7 @@ static int resize_stripes(struct r5conf *conf, int newsize)
+@@ -1907,6 +1930,7 @@ static int resize_stripes(struct r5conf
  			if (nsh->dev[i].page == NULL) {
  				struct page *p = alloc_page(GFP_NOIO);
  				nsh->dev[i].page = p;
@@ -175,7 +175,7 @@ index 348a857..d69fd98 100644
  				if (!p)
  					err = -ENOMEM;
  			}
-@@ -2141,24 +2165,20 @@ static void raid5_end_write_request(struct bio *bi, int error)
+@@ -2145,24 +2169,20 @@ static void raid5_end_write_request(stru
  }
  
  static sector_t compute_blocknr(struct stripe_head *sh, int i, int previous);
@@ -203,7 +203,7 @@ index 348a857..d69fd98 100644
  
  	dev->flags = 0;
  	dev->sector = compute_blocknr(sh, i, previous);
-@@ -2758,6 +2778,11 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
+@@ -2762,6 +2782,11 @@ handle_failed_stripe(struct r5conf *conf
  		/* and fail all 'written' */
  		bi = sh->dev[i].written;
  		sh->dev[i].written = NULL;
@@ -213,9 +213,9 @@ index 348a857..d69fd98 100644
 +		}
 +
  		if (bi) bitmap_end = 1;
- 		while (bi && bi->bi_iter.bi_sector <
+ 		while (bi && bi->bi_sector <
  		       sh->dev[i].sector + STRIPE_SECTORS) {
-@@ -3002,12 +3027,17 @@ static void handle_stripe_clean_event(struct r5conf *conf,
+@@ -3004,12 +3029,17 @@ static void handle_stripe_clean_event(st
  			dev = &sh->dev[i];
  			if (!test_bit(R5_LOCKED, &dev->flags) &&
  			    (test_bit(R5_UPTODATE, &dev->flags) ||
@@ -233,8 +233,8 @@ index 348a857..d69fd98 100644
 +				}
  				wbi = dev->written;
  				dev->written = NULL;
- 				while (wbi && wbi->bi_iter.bi_sector <
-@@ -3026,6 +3056,8 @@ static void handle_stripe_clean_event(struct r5conf *conf,
+ 				while (wbi && wbi->bi_sector <
+@@ -3028,6 +3058,8 @@ static void handle_stripe_clean_event(st
  						0);
  			} else if (test_bit(R5_Discard, &dev->flags))
  				discard_pending = 1;
@@ -243,7 +243,7 @@ index 348a857..d69fd98 100644
  		}
  	if (!discard_pending &&
  	    test_bit(R5_Discard, &sh->dev[sh->pd_idx].flags)) {
-@@ -5366,6 +5398,50 @@ raid5_preread_bypass_threshold = __ATTR(preread_bypass_threshold,
+@@ -5375,6 +5407,50 @@ raid5_preread_bypass_threshold = __ATTR(
  					raid5_store_preread_threshold);
  
  static ssize_t
@@ -294,7 +294,7 @@ index 348a857..d69fd98 100644
  stripe_cache_active_show(struct mddev *mddev, char *page)
  {
  	struct r5conf *conf = mddev->private;
-@@ -5450,6 +5526,7 @@ static struct attribute *raid5_attrs[] =  {
+@@ -5462,6 +5538,7 @@ static struct attribute *raid5_attrs[] =
  	&raid5_stripecache_active.attr,
  	&raid5_preread_bypass_threshold.attr,
  	&raid5_group_thread_cnt.attr,
@@ -302,8 +302,6 @@ index 348a857..d69fd98 100644
  	NULL,
  };
  static struct attribute_group raid5_attrs_group = {
-diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
-index 01ad8ae..bc72cd4 100644
 --- a/drivers/md/raid5.h
 +++ b/drivers/md/raid5.h
 @@ -232,7 +232,7 @@ struct stripe_head {
@@ -331,6 +329,3 @@ index 01ad8ae..bc72cd4 100644
  	struct list_head	*last_hold; /* detect hold_list promotions */
  
  	atomic_t		reshape_stripes; /* stripes with pending writes for reshape */
--- 
-2.6.2
-

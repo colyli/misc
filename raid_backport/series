@@ -2,7 +2,7 @@ patches.raid5perf/0000-wait_event_cmd.patch
 patches.raid5perf/0001-raid5-relieve-lock-contention-in-get_active_stripe.patch
 patches.raid5perf/0002-raid5-relieve-lock-contention-in-get_active_stripe.patch
 patches.raid5perf/0003-raid5-Retry-R5_ReadNoMerge-flag-when-hit-a-read-erro.patch
-patches.raid5perf/0004-md-use-MD_RECOVERY_INTR-instead-of-kthread_should_st.patch
+#patches.raid5perf/0004-md-use-MD_RECOVERY_INTR-instead-of-kthread_should_st.patch
 patches.raid5perf/0005-md-raid5-For-stripe-with-R5_ReadNoMerge-we-replace-R.patch
 patches.raid5perf/0006-md-raid5-fix-newly-broken-locking-in-get_active_stri.patch
 patches.raid5perf/0007-bcache-md-Use-raid-stripe-size.patch
@@ -15,11 +15,11 @@ patches.raid5perf/0013-raid5-avoid-release-list-until-last-reference-of-the.patc
 patches.raid5perf/0014-raid5-add-an-option-to-avoid-copy-data-from-bio-to-s.patch
 patches.raid5perf/0015-md-raid5-deadlock-between-retry_aligned_read-with-ba.patch
 patches.raid5perf/0016-raid5-speedup-sync_request-processing.patch
-patches.raid5perf/0017-md-raid5-avoid-livelock-caused-by-non-aligned-writes.patch
+# skip patches.raid5perf/0017-md-raid5-avoid-livelock-caused-by-non-aligned-writes.patch
 patches.raid5perf/0018-md-use-set_bit-clear_bit-instead-of-shift-mask-for-b.patch
 patches.raid5perf/0019-md-raid5-fix-init_stripe-inconsistencies.patch
 patches.raid5perf/0020-md-remove-unwanted-white-space-from-md.c.patch
-patches.raid5perf/0021-md-raid5-fetch_block-must-fetch-all-the-blocks-handl.patch
+# skip patches.raid5perf/0021-md-raid5-fetch_block-must-fetch-all-the-blocks-handl.patch
 patches.raid5perf/0022-md-raid5-fix-another-livelock-caused-by-non-aligned-.patch
 patches.raid5perf/0023-md-do_release_stripe-No-need-to-call-md_wakeup_threa.patch
 patches.raid5perf/0024-md-raid5-separate-large-if-clause-out-of-fetch_block.patch
@@ -55,6 +55,7 @@ patches.raid5perf/0053-md-raid5-be-more-selective-about-distributing-flags-.patc
 patches.raid5perf/0054-md-raid5-call-break_stripe_batch_list-from-handle_st.patch
 patches.raid5perf/0055-md-raid5-break-stripe-batches-when-the-array-has-fai.patch
 patches.raid5perf/0056-md-make-sure-MD_RECOVERY_DONE-is-clear-before-starti.patch
+patches.raid5perf/0056-wait-introduce-wait_event_exclusive_cmd.patch
 patches.raid5perf/0057-md-raid5-split-wait_for_stripe-and-introduce-wait_fo.patch
 patches.raid5perf/0058-md-raid5-per-hash-value-and-exclusive-wait_for_strip.patch
 patches.raid5perf/0059-md-raid5-ignore-released_stripes-check.patch
@@ -75,4 +76,3 @@ patches.raid5perf/0073-raid5-update-analysis-state-for-failed-stripe.patch
 patches.raid5perf/0074-md-raid5-don-t-index-beyond-end-of-array-in-need_thi.patch
 patches.raid5perf/0075-md-raid5-fix-locking-in-handle_stripe_clean_event.patch
 patches.raid5perf/0076-md-raid5-remove-redundant-check-in-stripe_add_to_bat.patch
-

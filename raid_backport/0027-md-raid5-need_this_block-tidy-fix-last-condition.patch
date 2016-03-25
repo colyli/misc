@@ -25,22 +25,20 @@ the relevant tests more  thoroughly.
 
 Signed-off-by: NeilBrown <neilb@suse.de>
 ---
- drivers/md/raid5.c | 42 ++++++++++++++++++++++++++++++++----------
+ drivers/md/raid5.c |   42 ++++++++++++++++++++++++++++++++----------
  1 file changed, 32 insertions(+), 10 deletions(-)
 
-diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
-index bb42551..a03cf2d 100644
 --- a/drivers/md/raid5.c
 +++ b/drivers/md/raid5.c
-@@ -2902,6 +2902,7 @@ static int need_this_block(struct stripe_head *sh, struct stripe_head_state *s,
+@@ -2902,6 +2902,7 @@ static int need_this_block(struct stripe
  	struct r5dev *dev = &sh->dev[disk_idx];
  	struct r5dev *fdev[2] = { &sh->dev[s->failed_num[0]],
  				  &sh->dev[s->failed_num[1]] };
 +	int i;
  
- 
  	if (test_bit(R5_LOCKED, &dev->flags) ||
-@@ -2949,16 +2950,37 @@ static int need_this_block(struct stripe_head *sh, struct stripe_head_state *s,
+ 	    test_bit(R5_UPTODATE, &dev->flags))
+@@ -2948,16 +2949,37 @@ static int need_this_block(struct stripe
  		 * and there is no need to delay that.
  		 */
  		return 0;
@@ -88,6 +86,3 @@ index bb42551..a03cf2d 100644
  	return 0;
  }
  
--- 
-2.6.2
-

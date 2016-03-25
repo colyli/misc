@@ -34,17 +34,17 @@ used as a minimum.  The cache can grow above this and shrink back
 down to it.  The actual size is not directly visible, though it can
 be deduced to some extent by watching stripe_cache_active.
 
+(colyli: rebased)
+
 Signed-off-by: NeilBrown <neilb@suse.de>
 ---
- drivers/md/raid5.c | 68 ++++++++++++++++++++++++++++++++++++++++++++++++------
- drivers/md/raid5.h | 11 ++++++++-
+ drivers/md/raid5.c |   68 +++++++++++++++++++++++++++++++++++++++++++++++------
+ drivers/md/raid5.h |   11 +++++++-
  2 files changed, 71 insertions(+), 8 deletions(-)
 
-diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
-index b7cd32e..9716319 100644
 --- a/drivers/md/raid5.c
 +++ b/drivers/md/raid5.c
-@@ -672,8 +672,13 @@ get_active_stripe(struct r5conf *conf, sector_t sector,
+@@ -672,8 +672,13 @@ get_active_stripe(struct r5conf *conf, s
  				    *(conf->hash_locks + hash));
  		sh = __find_stripe(conf, sector, conf->generation - previous);
  		if (!sh) {
@@ -59,7 +59,7 @@ index b7cd32e..9716319 100644
  			if (noblock && sh == NULL)
  				break;
  			if (!sh) {
-@@ -5761,6 +5766,8 @@ static void raid5d(struct md_thread *thread)
+@@ -5724,6 +5729,8 @@ static void raid5d(struct md_thread *thr
  		int batch_size, released;
  
  		released = release_stripe_list(conf, conf->temp_inactive_list);
@@ -68,7 +68,7 @@ index b7cd32e..9716319 100644
  
  		if (
  		    !list_empty(&conf->bitmap_list)) {
-@@ -5799,6 +5806,13 @@ static void raid5d(struct md_thread *thread)
+@@ -5762,6 +5769,13 @@ static void raid5d(struct md_thread *thr
  	pr_debug("%d stripes handled\n", handled);
  
  	spin_unlock_irq(&conf->device_lock);
@@ -82,16 +82,16 @@ index b7cd32e..9716319 100644
  
  	async_tx_issue_pending_all();
  	blk_finish_plug(&plug);
-@@ -5814,7 +5828,7 @@ raid5_show_stripe_cache_size(struct mddev *mddev, char *page)
- 	spin_lock(&mddev->lock);
+@@ -5777,7 +5791,7 @@ raid5_show_stripe_cache_size(struct mdde
+ 	spin_lock(&mddev->write_lock);
  	conf = mddev->private;
  	if (conf)
 -		ret = sprintf(page, "%d\n", conf->max_nr_stripes);
 +		ret = sprintf(page, "%d\n", conf->min_nr_stripes);
- 	spin_unlock(&mddev->lock);
+ 	spin_unlock(&mddev->write_lock);
  	return ret;
  }
-@@ -5828,10 +5842,12 @@ raid5_set_cache_size(struct mddev *mddev, int size)
+@@ -5791,10 +5805,12 @@ raid5_set_cache_size(struct mddev *mddev
  	if (size <= 16 || size > 32768)
  		return -EINVAL;
  
@@ -104,16 +104,16 @@ index b7cd32e..9716319 100644
  	err = md_allow_write(mddev);
  	if (err)
  		return err;
-@@ -5947,7 +5963,7 @@ raid5_store_preread_threshold(struct mddev *mddev, const char *page, size_t len)
- 	conf = mddev->private;
- 	if (!conf)
- 		err = -ENODEV;
--	else if (new > conf->max_nr_stripes)
-+	else if (new > conf->min_nr_stripes)
- 		err = -EINVAL;
- 	else
- 		conf->bypass_threshold = new;
-@@ -6228,6 +6244,8 @@ static void raid5_free_percpu(struct r5conf *conf)
+@@ -5857,7 +5873,7 @@ raid5_store_preread_threshold(struct mdd
+ 
+ 	if (kstrtoul(page, 10, &new))
+ 		return -EINVAL;
+-	if (new > conf->max_nr_stripes)
++	if (new > conf->min_nr_stripes)
+ 		return -EINVAL;
+ 	conf->bypass_threshold = new;
+ 	return len;
+@@ -6129,6 +6145,8 @@ static void raid5_free_percpu(struct r5c
  
  static void free_conf(struct r5conf *conf)
  {
@@ -122,7 +122,7 @@ index b7cd32e..9716319 100644
  	free_thread_groups(conf);
  	shrink_stripes(conf);
  	raid5_free_percpu(conf);
-@@ -6295,6 +6313,30 @@ static int raid5_alloc_percpu(struct r5conf *conf)
+@@ -6196,6 +6214,30 @@ static int raid5_alloc_percpu(struct r5c
  	return err;
  }
  
@@ -153,7 +153,7 @@ index b7cd32e..9716319 100644
  static struct r5conf *setup_conf(struct mddev *mddev)
  {
  	struct r5conf *conf;
-@@ -6445,10 +6487,11 @@ static struct r5conf *setup_conf(struct mddev *mddev)
+@@ -6340,10 +6382,11 @@ static struct r5conf *setup_conf(struct
  		conf->prev_algo = mddev->layout;
  	}
  
@@ -167,7 +167,7 @@ index b7cd32e..9716319 100644
  		printk(KERN_ERR
  		       "md/raid:%s: couldn't allocate %dkB for buffers\n",
  		       mdname(mddev), memory);
-@@ -6456,6 +6499,17 @@ static struct r5conf *setup_conf(struct mddev *mddev)
+@@ -6351,6 +6394,17 @@ static struct r5conf *setup_conf(struct
  	} else
  		printk(KERN_INFO "md/raid:%s: allocated %dkB\n",
  		       mdname(mddev), memory);
@@ -185,7 +185,7 @@ index b7cd32e..9716319 100644
  
  	sprintf(pers_name, "raid%d", mddev->new_level);
  	conf->thread = md_register_thread(raid5d, mddev, pers_name);
-@@ -7097,9 +7151,9 @@ static int check_stripe_cache(struct mddev *mddev)
+@@ -7004,9 +7058,9 @@ static int check_stripe_cache(struct mdd
  	 */
  	struct r5conf *conf = mddev->private;
  	if (((mddev->chunk_sectors << 9) / STRIPE_SIZE) * 4
@@ -197,11 +197,9 @@ index b7cd32e..9716319 100644
  		printk(KERN_WARNING "md/raid:%s: reshape: not enough stripes.  Needed %lu\n",
  		       mdname(mddev),
  		       ((max(mddev->chunk_sectors, mddev->new_chunk_sectors) << 9)
-diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
-index ebe4e24..7dc0dd8 100644
 --- a/drivers/md/raid5.h
 +++ b/drivers/md/raid5.h
-@@ -433,6 +433,7 @@ struct r5conf {
+@@ -415,6 +415,7 @@ struct r5conf {
  	int			max_degraded;
  	int			raid_disks;
  	int			max_nr_stripes;
@@ -209,7 +207,7 @@ index ebe4e24..7dc0dd8 100644
  
  	/* reshape_progress is the leading edge of a 'reshape'
  	 * It has value MaxSector when no reshape is happening
-@@ -513,7 +514,15 @@ struct r5conf {
+@@ -495,7 +496,15 @@ struct r5conf {
  #define R5_INACTIVE_BLOCKED	1	/* release of inactive stripes blocked,
  					 * waiting for 25% to be free
  					 */
@@ -226,6 +224,3 @@ index ebe4e24..7dc0dd8 100644
  	int			pool_size; /* number of disks in stripeheads in pool */
  	spinlock_t		device_lock;
  	struct disk_info	*disks;
--- 
-2.6.2
-

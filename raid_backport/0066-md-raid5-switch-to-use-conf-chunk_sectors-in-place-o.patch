@@ -20,26 +20,24 @@ Also use min() or max() rather than open-coding.
 
 Signed-off-by: NeilBrown <neilb@suse.com>
 ---
- drivers/md/raid5.c | 28 ++++++++++++++--------------
+ drivers/md/raid5.c |   28 ++++++++++++++--------------
  1 file changed, 14 insertions(+), 14 deletions(-)
 
-diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
-index e543bfd..a98162f 100644
 --- a/drivers/md/raid5.c
 +++ b/drivers/md/raid5.c
-@@ -4676,9 +4676,10 @@ static int raid5_mergeable_bvec(struct mddev *mddev,
- 				struct bvec_merge_data *bvm,
+@@ -4639,9 +4639,10 @@ static int raid5_mergeable_bvec(struct r
  				struct bio_vec *biovec)
  {
+ 	struct mddev *mddev = q->queuedata;
 +	struct r5conf *conf = mddev->private;
  	sector_t sector = bvm->bi_sector + get_start_sect(bvm->bi_bdev);
  	int max;
 -	unsigned int chunk_sectors = mddev->chunk_sectors;
-+	unsigned int chunk_sectors;
++	unsigned int chunk_sectors; 
  	unsigned int bio_sectors = bvm->bi_size >> 9;
  
  	/*
-@@ -4688,8 +4689,7 @@ static int raid5_mergeable_bvec(struct mddev *mddev,
+@@ -4651,8 +4652,7 @@ static int raid5_mergeable_bvec(struct r
  	if ((bvm->bi_rw & 1) == WRITE || mddev->degraded)
  		return biovec->bv_len;
  
@@ -49,12 +47,12 @@ index e543bfd..a98162f 100644
  	max =  (chunk_sectors - ((sector & (chunk_sectors - 1)) + bio_sectors)) << 9;
  	if (max < 0) max = 0;
  	if (max <= biovec->bv_len && bio_sectors == 0)
-@@ -4700,12 +4700,12 @@ static int raid5_mergeable_bvec(struct mddev *mddev,
+@@ -4663,12 +4663,12 @@ static int raid5_mergeable_bvec(struct r
  
  static int in_chunk_boundary(struct mddev *mddev, struct bio *bio)
  {
 +	struct r5conf *conf = mddev->private;
- 	sector_t sector = bio->bi_iter.bi_sector + get_start_sect(bio->bi_bdev);
+ 	sector_t sector = bio->bi_sector + get_start_sect(bio->bi_bdev);
 -	unsigned int chunk_sectors = mddev->chunk_sectors;
 +	unsigned int chunk_sectors;
  	unsigned int bio_sectors = bio_sectors(bio);
@@ -65,7 +63,7 @@ index e543bfd..a98162f 100644
  	return  chunk_sectors >=
  		((sector & (chunk_sectors - 1)) + bio_sectors);
  }
-@@ -5372,10 +5372,8 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr, int *sk
+@@ -5361,10 +5361,8 @@ static sector_t reshape_request(struct m
  	 * If old and new chunk sizes differ, we need to process the
  	 * largest of these
  	 */
@@ -78,7 +76,7 @@ index e543bfd..a98162f 100644
  
  	/* We update the metadata at least every 10 seconds, or when
  	 * the data about to be copied would over-write the source of
-@@ -6260,8 +6258,8 @@ raid5_size(struct mddev *mddev, sector_t sectors, int raid_disks)
+@@ -6187,8 +6185,8 @@ raid5_size(struct mddev *mddev, sector_t
  		/* size is defined by the smallest of previous and new size */
  		raid_disks = min(conf->raid_disks, conf->previous_raid_disks);
  
@@ -89,7 +87,7 @@ index e543bfd..a98162f 100644
  	return sectors * (raid_disks - conf->max_degraded);
  }
  
-@@ -6996,7 +6994,7 @@ static void status(struct seq_file *seq, struct mddev *mddev)
+@@ -6929,7 +6927,7 @@ static void status(struct seq_file *seq,
  	int i;
  
  	seq_printf(seq, " level %d, %dk chunk, algorithm %d", mddev->level,
@@ -98,7 +96,7 @@ index e543bfd..a98162f 100644
  	seq_printf (seq, " [%d/%d] [", conf->raid_disks, conf->raid_disks - mddev->degraded);
  	for (i = 0; i < conf->raid_disks; i++)
  		seq_printf (seq, "%s",
-@@ -7202,7 +7200,9 @@ static int raid5_resize(struct mddev *mddev, sector_t sectors)
+@@ -7135,7 +7133,9 @@ static int raid5_resize(struct mddev *md
  	 * worth it.
  	 */
  	sector_t newsize;
@@ -109,6 +107,3 @@ index e543bfd..a98162f 100644
  	newsize = raid5_size(mddev, sectors, mddev->raid_disks);
  	if (mddev->external_size &&
  	    mddev->array_sectors > newsize)
--- 
-2.6.2
-
