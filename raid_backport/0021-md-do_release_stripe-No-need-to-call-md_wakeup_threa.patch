@@ -1,0 +1,40 @@
+From ad3ab8b608c454f004391bb8568916bd955001ea Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Thu, 29 Jan 2015 12:38:29 -0500
+Subject: [PATCH] md: do_release_stripe(): No need to call md_wakeup_thread()
+ twice
+Git-commit: ad3ab8b608c454f004391bb8568916bd955001ea
+Patch-mainline: v4.0-rc1
+Reference: bsc#953048
+
+67f455486d2ea20b2d94d6adf5b9b783d079e321 introduced a call to
+md_wakeup_thread() when adding to the delayed_list. However the md
+thread is woken up unconditionally just below.
+
+Remove the unnecessary wakeup call.
+
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |    7 ++-----
+ 1 file changed, 2 insertions(+), 5 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -296,12 +296,9 @@ static void do_release_stripe(struct r5c
+ 	BUG_ON(atomic_read(&conf->active_stripes)==0);
+ 	if (test_bit(STRIPE_HANDLE, &sh->state)) {
+ 		if (test_bit(STRIPE_DELAYED, &sh->state) &&
+-		    !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state)) {
++		    !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+ 			list_add_tail(&sh->lru, &conf->delayed_list);
+-			if (atomic_read(&conf->preread_active_stripes)
+-			    < IO_THRESHOLD)
+-				md_wakeup_thread(conf->mddev->thread);
+-		} else if (test_bit(STRIPE_BIT_DELAY, &sh->state) &&
++		else if (test_bit(STRIPE_BIT_DELAY, &sh->state) &&
+ 			   sh->bm_seq - conf->seq_write > 0)
+ 			list_add_tail(&sh->lru, &conf->bitmap_list);
+ 		else {

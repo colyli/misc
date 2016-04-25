@@ -1,0 +1,51 @@
+From 6cbd81487f7cfa30e22537bf7cd07f48c4e7164d Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Fri, 24 Jul 2015 13:30:32 +1000
+Subject: [PATCH] md/raid5: handle possible race as reshape completes.
+Git-commit: 6cbd81487f7cfa30e22537bf7cd07f48c4e7164d
+Patch-mainline: v4.3-rc1
+Reference: bsc#953048
+
+It is possible (though unlikely) for a reshape to be
+interrupted between the time that end_reshape is called
+and the time when raid5_finish_reshape is called.
+
+This can leave conf->reshape_progress set to MaxSector,
+but mddev->reshape_position not.
+
+This combination confused reshape_request() when ->reshape_backwards.
+As conf->reshape_progress is so high, it seems the reshape hasn't
+really begun.  But assuming MaxSector is a valid address only
+leads to sorrow.
+
+So ensure reshape_position and reshape_progress both agree,
+and add an extra check in reshape_request() just in case they don't.
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |    5 +++++
+ 1 file changed, 5 insertions(+)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5317,6 +5317,10 @@ static sector_t reshape_request(struct m
+ 		    conf->reshape_progress < raid5_size(mddev, 0, 0)) {
+ 			sector_nr = raid5_size(mddev, 0, 0)
+ 				- conf->reshape_progress;
++		} else if (mddev->reshape_backwards &&
++			   conf->reshape_progress == MaxSector) {
++			/* shouldn't happen, but just in case, finish up.*/
++			sector_nr = MaxSector;
+ 		} else if (!mddev->reshape_backwards &&
+ 			   conf->reshape_progress > 0)
+ 			sector_nr = conf->reshape_progress;
+@@ -7352,6 +7356,7 @@ static void end_reshape(struct r5conf *c
+ 			rdev->data_offset = rdev->new_data_offset;
+ 		smp_wmb();
+ 		conf->reshape_progress = MaxSector;
++		conf->mddev->reshape_position = MaxSector;
+ 		spin_unlock_irq(&conf->device_lock);
+ 		wake_up(&conf->wait_for_overlap);
+ 

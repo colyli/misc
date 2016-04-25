@@ -1,0 +1,80 @@
+From: Yuanhan Liu <yuanhan.liu@linux.intel.com>
+Author: Yuanhan Liu <yuanhan.liu@linux.intel.com>
+Date: Fri May 8 18:19:05 2015 +1000
+Subject: [PATCH] wait: introduce wait_event_exclusive_cmd
+Git-commit: 9f3520c3115b451ac1301779fc3c769d94907a70
+Patch-mainline: v4.2-rc1
+Reference: bsc#953048
+
+It's just a variant of wait_event_cmd(), with exclusive flag being set.
+
+For cases like RAID5, which puts many processes to sleep until 1/4
+resources are free, a wake_up wakes up all processes to run, but
+there is one process being able to get the resource as it's protected
+by a spin lock. That ends up introducing heavy lock contentions, and
+hurts performance badly.
+    
+Here introduce wait_event_exclusive_cmd to relieve the lock contention
+naturally by letting wake_up just wake up one process.
+    
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+V2: its assumed that wait*() and __wait*() have the same arguments - peterz
+
+(colyli: rewrite this patch based on SLE12-SP1 kernel)
+
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Yuanhan Liu <yuanhan.liu@linux.intel.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ include/linux/wait.h |   30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+--- a/include/linux/wait.h
++++ b/include/linux/wait.h
+@@ -199,6 +199,10 @@ do {									\
+ 	finish_wait(&wq, &__wait);					\
+ } while (0)
+ 
++#define ___wait_is_interruptible(state)					\
++        (!__builtin_constant_p(state) ||				\
++                state == TASK_INTERRUPTIBLE || state == TASK_KILLABLE)  \
++
+ /**
+  * wait_event - sleep until a condition gets true
+  * @wq: the waitqueue to wait on
+@@ -247,6 +251,32 @@ do {									\
+ 	finish_wait(&wq, &__wait);					\
+ } while(0)
+ 
++/*
++ * rewrite wait_event_exclusive_cmd() based on SLE12-SP1 kernel 
++ */
++#define wait_event_exclusive_cmd(wq, condition, cmd1, cmd2)		\
++do {									\
++	int __state = TASK_UNINTERRUPTIBLE;				\
++	DEFINE_WAIT(__wait);						\
++	__wait.flags = WQ_FLAG_EXCLUSIVE;				\
++									\
++	for (;;) {							\
++		prepare_to_wait(&wq, &__wait, __state);			\
++		if (condition)						\
++			break;						\
++		if (___wait_is_interruptible(__state) &&			\
++		    signal_pending_state(__state, current)) {		\
++			abort_exclusive_wait(&wq, &__wait,		\
++					     __state, NULL);		\
++			break;						\
++		}							\
++		cmd1;							\
++		schedule();						\
++		cmd2;							\
++	}								\
++	finish_wait(&wq, &__wait);					\
++} while (0)
++
+ #define __wait_event_timeout(wq, condition, ret)			\
+ do {									\
+ 	DEFINE_WAIT(__wait);						\

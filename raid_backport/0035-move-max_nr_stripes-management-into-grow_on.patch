@@ -1,0 +1,163 @@
+From 486f0644c3482cbf64fe804499836e1f05abec14 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Wed, 25 Feb 2015 12:10:35 +1100
+Subject: [PATCH] md/raid5: move max_nr_stripes management into grow_one_stripe
+ and drop_one_stripe
+Git-commit: 486f0644c3482cbf64fe804499836e1f05abec14
+Patch-mainline: v4.1-rc1
+Reference: bsc#953048
+
+Rather than adjusting max_nr_stripes whenever {grow,drop}_one_stripe()
+succeeds, do it inside the functions.
+
+Also choose the correct hash to handle next inside the functions.
+
+This removes duplication and will help with future new uses of
+{grow,drop}_one_stripe.
+
+This also fixes a minor bug where the "md/raid:%md: allocate XXkB"
+message always said "0kB".
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |   57 ++++++++++++++++++++++-------------------------------
+ 1 file changed, 24 insertions(+), 33 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -1918,7 +1918,7 @@ static void raid_run_ops(struct stripe_h
+ 	put_cpu();
+ }
+ 
+-static int grow_one_stripe(struct r5conf *conf, int hash, gfp_t gfp)
++static int grow_one_stripe(struct r5conf *conf, gfp_t gfp)
+ {
+ 	struct stripe_head *sh;
+ 	sh = kmem_cache_zalloc(conf->slab_cache, gfp);
+@@ -1934,7 +1934,8 @@ static int grow_one_stripe(struct r5conf
+ 		kmem_cache_free(conf->slab_cache, sh);
+ 		return 0;
+ 	}
+-	sh->hash_lock_index = hash;
++	sh->hash_lock_index =
++		conf->max_nr_stripes % NR_STRIPE_HASH_LOCKS;
+ 	/* we just created an active stripe so... */
+ 	atomic_set(&sh->count, 1);
+ 	atomic_inc(&conf->active_stripes);
+@@ -1944,6 +1945,7 @@ static int grow_one_stripe(struct r5conf
+ 	INIT_LIST_HEAD(&sh->batch_list);
+ 	sh->batch_head = NULL;
+ 	release_stripe(sh);
++	conf->max_nr_stripes++;
+ 	return 1;
+ }
+ 
+@@ -1951,7 +1953,6 @@ static int grow_stripes(struct r5conf *c
+ {
+ 	struct kmem_cache *sc;
+ 	int devs = max(conf->raid_disks, conf->previous_raid_disks);
+-	int hash;
+ 
+ 	if (conf->mddev->gendisk)
+ 		sprintf(conf->cache_name[0],
+@@ -1969,13 +1970,10 @@ static int grow_stripes(struct r5conf *c
+ 		return 1;
+ 	conf->slab_cache = sc;
+ 	conf->pool_size = devs;
+-	hash = conf->max_nr_stripes % NR_STRIPE_HASH_LOCKS;
+-	while (num--) {
+-		if (!grow_one_stripe(conf, hash, GFP_KERNEL))
++	while (num--)
++		if (!grow_one_stripe(conf, GFP_KERNEL))
+ 			return 1;
+-		conf->max_nr_stripes++;
+-		hash = (hash + 1) % NR_STRIPE_HASH_LOCKS;
+-	}
++
+ 	return 0;
+ }
+ 
+@@ -2166,9 +2164,10 @@ static int resize_stripes(struct r5conf
+ 	return err;
+ }
+ 
+-static int drop_one_stripe(struct r5conf *conf, int hash)
++static int drop_one_stripe(struct r5conf *conf)
+ {
+ 	struct stripe_head *sh;
++	int hash = (conf->max_nr_stripes - 1) % NR_STRIPE_HASH_LOCKS;
+ 
+ 	spin_lock_irq(conf->hash_locks + hash);
+ 	sh = get_free_stripe(conf, hash);
+@@ -2179,15 +2178,15 @@ static int drop_one_stripe(struct r5conf
+ 	shrink_buffers(sh);
+ 	kmem_cache_free(conf->slab_cache, sh);
+ 	atomic_dec(&conf->active_stripes);
++	conf->max_nr_stripes--;
+ 	return 1;
+ }
+ 
+ static void shrink_stripes(struct r5conf *conf)
+ {
+-	int hash;
+-	for (hash = 0; hash < NR_STRIPE_HASH_LOCKS; hash++)
+-		while (drop_one_stripe(conf, hash))
+-			;
++	while (conf->max_nr_stripes &&
++	       drop_one_stripe(conf))
++		;
+ 
+ 	if (conf->slab_cache)
+ 		kmem_cache_destroy(conf->slab_cache);
+@@ -5785,30 +5784,22 @@ raid5_set_cache_size(struct mddev *mddev
+ {
+ 	struct r5conf *conf = mddev->private;
+ 	int err;
+-	int hash;
+ 
+ 	if (size <= 16 || size > 32768)
+ 		return -EINVAL;
+-	hash = (conf->max_nr_stripes - 1) % NR_STRIPE_HASH_LOCKS;
+-	while (size < conf->max_nr_stripes) {
+-		if (drop_one_stripe(conf, hash))
+-			conf->max_nr_stripes--;
+-		else
+-			break;
+-		hash--;
+-		if (hash < 0)
+-			hash = NR_STRIPE_HASH_LOCKS - 1;
+-	}
++
++	while (size < conf->max_nr_stripes &&
++	       drop_one_stripe(conf))
++		;
++
+ 	err = md_allow_write(mddev);
+ 	if (err)
+ 		return err;
+-	hash = conf->max_nr_stripes % NR_STRIPE_HASH_LOCKS;
+-	while (size > conf->max_nr_stripes) {
+-		if (grow_one_stripe(conf, hash, GFP_KERNEL))
+-			conf->max_nr_stripes++;
+-		else break;
+-		hash = (hash + 1) % NR_STRIPE_HASH_LOCKS;
+-	}
++
++	while (size > conf->max_nr_stripes)
++		if (!grow_one_stripe(conf, GFP_KERNEL))
++			break;
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(raid5_set_cache_size);
+@@ -6346,7 +6337,7 @@ static struct r5conf *setup_conf(struct
+ 		conf->prev_algo = mddev->layout;
+ 	}
+ 
+-	memory = conf->max_nr_stripes * (sizeof(struct stripe_head) +
++	memory = NR_STRIPES * (sizeof(struct stripe_head) +
+ 		 max_disks * ((sizeof(struct bio) + PAGE_SIZE))) / 1024;
+ 	atomic_set(&conf->empty_inactive_list_nr, NR_STRIPE_HASH_LOCKS);
+ 	if (grow_stripes(conf, NR_STRIPES)) {

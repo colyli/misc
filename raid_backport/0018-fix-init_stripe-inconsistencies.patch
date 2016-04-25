@@ -1,0 +1,36 @@
+From b8e6a15a1af9b1c203002e7768e60136c4e0e5c6 Mon Sep 17 00:00:00 2001
+From: Markus Stockhausen <stockhausen@collogia.de>
+Date: Sat, 23 Aug 2014 20:19:27 +1000
+Subject: [PATCH] md/raid5: fix init_stripe() inconsistencies
+Git-commit: b8e6a15a1af9b1c203002e7768e60136c4e0e5c6
+Patch-mainline: v3.18-rc1
+Reference: bsc#953048
+
+Raid5: fix init_stripe() inconsistencies
+
+1) remove_hash() is not necessary. We will only be called right after
+   get_free_stripe(). There we have already a call to remove_hash().
+
+2) Tracing prints out the sector of the freed stripe and not the sector
+   that we want to initialize.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |    4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -531,9 +531,7 @@ static void init_stripe(struct stripe_he
+ 	BUG_ON(stripe_operations_active(sh));
+ 
+ 	pr_debug("init_stripe called, stripe %llu\n",
+-		(unsigned long long)sh->sector);
+-
+-	remove_hash(sh);
++		(unsigned long long)sector);
+ retry:
+ 	seq = read_seqcount_begin(&conf->gen_lock);
+ 	sh->generation = conf->generation - previous;

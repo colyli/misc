@@ -1,0 +1,129 @@
+From 738a273806ee0568369c9bb19ef3b102f54beef4 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Fri, 8 May 2015 18:19:39 +1000
+Subject: [PATCH] md/raid5: fix allocation of 'scribble' array.
+Git-commit: 738a273806ee0568369c9bb19ef3b102f54beef4
+Patch-mainline: v4.1-rc5
+Reference: bsc#953048
+
+As the new 'scribble' array is sized based on chunk size,
+we need to make sure the size matches the largest of 'old'
+and 'new' chunk sizes when the array is undergoing reshape.
+
+We also potentially need to resize it even when not resizing
+the stripe cache, as chunk size can change without changing
+number of devices.
+
+So move the 'resize' code into a separate function, and
+consider old and new sizes when allocating.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Fixes: 46d5b785621a ("raid5: use flex_array for scribble data")
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |   65 +++++++++++++++++++++++++++++++++++------------------
+ 1 file changed, 43 insertions(+), 22 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -2023,6 +2023,35 @@ static struct flex_array *scribble_alloc
+ 	return ret;
+ }
+ 
++static int resize_chunks(struct r5conf *conf, int new_disks, int new_sectors)
++{
++	unsigned long cpu;
++	int err = 0;
++
++	mddev_suspend(conf->mddev);
++	get_online_cpus();
++	for_each_present_cpu(cpu) {
++		struct raid5_percpu *percpu;
++		struct flex_array *scribble;
++
++		percpu = per_cpu_ptr(conf->percpu, cpu);
++		scribble = scribble_alloc(new_disks,
++					  new_sectors / STRIPE_SECTORS,
++					  GFP_NOIO);
++
++		if (scribble) {
++			flex_array_free(percpu->scribble);
++			percpu->scribble = scribble;
++		} else {
++			err = -ENOMEM;
++			break;
++		}
++	}
++	put_online_cpus();
++	mddev_resume(conf->mddev);
++	return err;
++}
++
+ static int resize_stripes(struct r5conf *conf, int newsize)
+ {
+ 	/* Make all the stripes able to hold 'newsize' devices.
+@@ -2051,7 +2080,6 @@ static int resize_stripes(struct r5conf
+ 	struct stripe_head *osh, *nsh;
+ 	LIST_HEAD(newstripes);
+ 	struct disk_info *ndisks;
+-	unsigned long cpu;
+ 	int err;
+ 	struct kmem_cache *sc;
+ 	int i;
+@@ -2133,25 +2161,6 @@ static int resize_stripes(struct r5conf
+ 	} else
+ 		err = -ENOMEM;
+ 
+-	get_online_cpus();
+-	for_each_present_cpu(cpu) {
+-		struct raid5_percpu *percpu;
+-		struct flex_array *scribble;
+-
+-		percpu = per_cpu_ptr(conf->percpu, cpu);
+-		scribble = scribble_alloc(newsize, conf->chunk_sectors /
+-			STRIPE_SECTORS, GFP_NOIO);
+-
+-		if (scribble) {
+-			flex_array_free(percpu->scribble);
+-			percpu->scribble = scribble;
+-		} else {
+-			err = -ENOMEM;
+-			break;
+-		}
+-	}
+-	put_online_cpus();
+-
+ 	/* Step 4, return new stripes to service */
+ 	while(!list_empty(&newstripes)) {
+ 		nsh = list_entry(newstripes.next, struct stripe_head, lru);
+@@ -6128,8 +6137,11 @@ static int alloc_scratch_buffer(struct r
+ 		percpu->spare_page = alloc_page(GFP_KERNEL);
+ 	if (!percpu->scribble)
+ 		percpu->scribble = scribble_alloc(max(conf->raid_disks,
+-			conf->previous_raid_disks), conf->chunk_sectors /
+-			STRIPE_SECTORS, GFP_KERNEL);
++						      conf->previous_raid_disks),
++						  max(conf->chunk_sectors,
++						      conf->prev_chunk_sectors)
++						   / STRIPE_SECTORS,
++						  GFP_KERNEL);
+ 
+ 	if (!percpu->scribble || (conf->level == 6 && !percpu->spare_page)) {
+ 		free_scratch_buffer(conf, percpu);
+@@ -7111,6 +7123,15 @@ static int check_reshape(struct mddev *m
+ 	if (!check_stripe_cache(mddev))
+ 		return -ENOSPC;
+ 
++	if (mddev->new_chunk_sectors > mddev->chunk_sectors ||
++	    mddev->delta_disks > 0)
++		if (resize_chunks(conf,
++				  conf->previous_raid_disks
++				  + max(0, mddev->delta_disks),
++				  max(mddev->new_chunk_sectors,
++				      mddev->chunk_sectors)
++			    ) < 0)
++			return -ENOMEM;
+ 	return resize_stripes(conf, (conf->previous_raid_disks
+ 				     + mddev->delta_disks));
+ }

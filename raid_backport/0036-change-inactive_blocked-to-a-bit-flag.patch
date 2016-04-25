@@ -1,0 +1,82 @@
+From 5423399a84ee1d92d29d763029ed40e4905cf50f Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Thu, 26 Feb 2015 12:21:04 +1100
+Subject: [PATCH] md/raid5: change ->inactive_blocked to a bit-flag.
+Git-commit: 5423399a84ee1d92d29d763029ed40e4905cf50f
+Patch-mainline: v4.1-rc1
+Reference: bsc#953048
+
+This allows us to easily add more (atomic) flags.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |   13 ++++++++-----
+ drivers/md/raid5.h |    9 ++++++---
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -672,20 +672,23 @@ get_active_stripe(struct r5conf *conf, s
+ 				    *(conf->hash_locks + hash));
+ 		sh = __find_stripe(conf, sector, conf->generation - previous);
+ 		if (!sh) {
+-			if (!conf->inactive_blocked)
++			if (!test_bit(R5_INACTIVE_BLOCKED, &conf->cache_state))
+ 				sh = get_free_stripe(conf, hash);
+ 			if (noblock && sh == NULL)
+ 				break;
+ 			if (!sh) {
+-				conf->inactive_blocked = 1;
++				set_bit(R5_INACTIVE_BLOCKED,
++					&conf->cache_state);
+ 				wait_event_lock_irq(
+ 					conf->wait_for_stripe,
+ 					!list_empty(conf->inactive_list + hash) &&
+ 					(atomic_read(&conf->active_stripes)
+ 					 < (conf->max_nr_stripes * 3 / 4)
+-					 || !conf->inactive_blocked),
++					 || !test_bit(R5_INACTIVE_BLOCKED,
++						      &conf->cache_state)),
+ 					*(conf->hash_locks + hash));
+-				conf->inactive_blocked = 0;
++				clear_bit(R5_INACTIVE_BLOCKED,
++					  &conf->cache_state);
+ 			} else {
+ 				init_stripe(sh, sector, previous);
+ 				atomic_inc(&sh->count);
+@@ -4556,7 +4559,7 @@ int md_raid5_congested(struct mddev *mdd
+ 	 * how busy the stripe_cache is
+ 	 */
+ 
+-	if (conf->inactive_blocked)
++	if (test_bit(R5_INACTIVE_BLOCKED, &conf->cache_state))
+ 		return 1;
+ 	if (conf->quiesce)
+ 		return 1;
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -491,9 +491,11 @@ struct r5conf {
+ 	struct llist_head	released_stripes;
+ 	wait_queue_head_t	wait_for_stripe;
+ 	wait_queue_head_t	wait_for_overlap;
+-	int			inactive_blocked;	/* release of inactive stripes blocked,
+-							 * waiting for 25% to be free
+-							 */
++	unsigned long		cache_state;
++#define R5_INACTIVE_BLOCKED	1	/* release of inactive stripes blocked,
++					 * waiting for 25% to be free
++					 */
++
+ 	int			pool_size; /* number of disks in stripeheads in pool */
+ 	spinlock_t		device_lock;
+ 	struct disk_info	*disks;
+@@ -508,6 +510,7 @@ struct r5conf {
+ 	int			worker_cnt_per_group;
+ };
+ 
++
+ /*
+  * Our supported algorithms
+  */

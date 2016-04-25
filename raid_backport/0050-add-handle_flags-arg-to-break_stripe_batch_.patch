@@ -1,0 +1,64 @@
+From 3960ce796198254b7a1b420dc9a26d80928523bd Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Thu, 21 May 2015 12:20:36 +1000
+Subject: [PATCH] md/raid5: add handle_flags arg to break_stripe_batch_list.
+Git-commit: 3960ce796198254b7a1b420dc9a26d80928523bd
+Patch-mainline: v4.1-rc6
+Reference: bsc#953048
+
+When we break a stripe_batch_list we sometimes want to set
+STRIPE_HANDLE on the individual stripes, and sometimes not.
+
+So pass a 'handle_flags' arg.  If it is zero, always set STRIPE_HANDLE
+(on non-head stripes).  If not zero, only set it if any of the given
+flags are present.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |   12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -4188,7 +4188,8 @@ static int clear_batch_ready(struct stri
+ 	return 0;
+ }
+ 
+-static void break_stripe_batch_list(struct stripe_head *head_sh)
++static void break_stripe_batch_list(struct stripe_head *head_sh,
++				    unsigned long handle_flags)
+ {
+ 	struct stripe_head *sh, *next;
+ 	int i;
+@@ -4214,8 +4215,9 @@ static void break_stripe_batch_list(stru
+ 		spin_lock_irq(&sh->stripe_lock);
+ 		sh->batch_head = NULL;
+ 		spin_unlock_irq(&sh->stripe_lock);
+-
+-		set_bit(STRIPE_HANDLE, &sh->state);
++		if (handle_flags == 0 ||
++		    sh->state & handle_flags)
++			set_bit(STRIPE_HANDLE, &sh->state);
+ 		release_stripe(sh);
+ 	}
+ 	spin_lock_irq(&head_sh->stripe_lock);
+@@ -4224,6 +4226,8 @@ static void break_stripe_batch_list(stru
+ 	for (i = 0; i < head_sh->disks; i++)
+ 		if (test_and_clear_bit(R5_Overlap, &head_sh->dev[i].flags))
+ 			do_wakeup = 1;
++	if (head_sh->state & handle_flags)
++		set_bit(STRIPE_HANDLE, &head_sh->state);
+ 
+ 	if (do_wakeup)
+ 		wake_up(&head_sh->raid_conf->wait_for_overlap);
+@@ -4252,7 +4256,7 @@ static void handle_stripe(struct stripe_
+ 	}
+ 
+ 	if (test_and_clear_bit(STRIPE_BATCH_ERR, &sh->state))
+-		break_stripe_batch_list(sh);
++		break_stripe_batch_list(sh, 0);
+ 
+ 	if (test_bit(STRIPE_SYNC_REQUESTED, &sh->state) && !sh->batch_head) {
+ 		spin_lock(&sh->stripe_lock);

@@ -1,0 +1,45 @@
+From 16d9cfab930bb6f4946cff8ba7429701fd15b414 Mon Sep 17 00:00:00 2001
+From: Eric Mei <eric.mei@seagate.com>
+Date: Tue, 6 Jan 2015 09:35:02 -0800
+Subject: [PATCH] raid5: check faulty flag for array status during recovery.
+Git-commit: 16d9cfab930bb6f4946cff8ba7429701fd15b414
+Patch-mainline: v4.0-rc2
+Reference: bsc#953048
+
+When we have more than 1 drive failure, it's possible we start
+rebuild one drive while leaving another faulty drive in array.
+To determine whether array will be optimal after building, current
+code only check whether a drive is missing, which could potentially
+lead to data corruption. This patch is to add checking Faulty flag.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |   13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5130,12 +5130,17 @@ static inline sector_t sync_request(stru
+ 		schedule_timeout_uninterruptible(1);
+ 	}
+ 	/* Need to check if array will still be degraded after recovery/resync
+-	 * We don't need to check the 'failed' flag as when that gets set,
+-	 * recovery aborts.
++	 * Note in case of > 1 drive failures it's possible we're rebuilding
++	 * one drive while leaving another faulty drive in array.
+ 	 */
+-	for (i = 0; i < conf->raid_disks; i++)
+-		if (conf->disks[i].rdev == NULL)
++	rcu_read_lock();
++	for (i = 0; i < conf->raid_disks; i++) {
++		struct md_rdev *rdev = ACCESS_ONCE(conf->disks[i].rdev);
++
++		if (rdev == NULL || test_bit(Faulty, &rdev->flags))
+ 			still_degraded = 1;
++	}
++	rcu_read_unlock();
+ 
+ 	bitmap_start_sync(mddev->bitmap, sector_nr, &sync_blocks, still_degraded);
+ 

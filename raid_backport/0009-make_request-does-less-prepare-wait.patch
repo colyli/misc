@@ -1,0 +1,107 @@
+From 27c0f68f0745218cec70f19ba7560c8c5fc3f817 Mon Sep 17 00:00:00 2001
+From: Shaohua Li <shli@kernel.org>
+Date: Wed, 9 Apr 2014 11:25:47 +0800
+Subject: [PATCH] raid5: make_request does less prepare wait
+Patch-mainline: v3.15-rc1
+Git-commit: 27c0f68f0745218cec70f19ba7560c8c5fc3f817 
+Refernece: bsc#953048
+
+In NUMA machine, prepare_to_wait/finish_wait in make_request exposes a
+lot of contention for sequential workload (or big request size
+workload). For such workload, each bio includes several stripes. So we
+can just do prepare_to_wait/finish_wait once for the whold bio instead
+of every stripe.  This reduces the lock contention completely for such
+workload. Random workload might have the similar lock contention too,
+but I didn't see it yet, maybe because my stroage is still not fast
+enough.
+
+Signed-off-by: Shaohua Li <shli@fusionio.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+---
+ drivers/md/raid5.c |   19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -4559,6 +4559,8 @@ static void make_request(struct mddev *m
+ 	struct stripe_head *sh;
+ 	const int rw = bio_data_dir(bi);
+ 	int remaining;
++	DEFINE_WAIT(w);
++	bool do_prepare;
+ 
+ 	if (unlikely(bi->bi_rw & REQ_FLUSH)) {
+ 		md_flush_request(mddev, bi);
+@@ -4582,15 +4584,18 @@ static void make_request(struct mddev *m
+ 	bi->bi_next = NULL;
+ 	bi->bi_phys_segments = 1;	/* over-loaded to count active stripes */
+ 
++	prepare_to_wait(&conf->wait_for_overlap, &w, TASK_UNINTERRUPTIBLE);
+ 	for (;logical_sector < last_sector; logical_sector += STRIPE_SECTORS) {
+-		DEFINE_WAIT(w);
+ 		int previous;
+ 		int seq;
+ 
++		do_prepare = false;
+ 	retry:
+ 		seq = read_seqcount_begin(&conf->gen_lock);
+ 		previous = 0;
+-		prepare_to_wait(&conf->wait_for_overlap, &w, TASK_UNINTERRUPTIBLE);
++		if (do_prepare)
++			prepare_to_wait(&conf->wait_for_overlap, &w,
++				TASK_UNINTERRUPTIBLE);
+ 		if (unlikely(conf->reshape_progress != MaxSector)) {
+ 			/* spinlock is needed as reshape_progress may be
+ 			 * 64bit on a 32bit platform, and so it might be
+@@ -4611,6 +4616,7 @@ static void make_request(struct mddev *m
+ 				    : logical_sector >= conf->reshape_safe) {
+ 					spin_unlock_irq(&conf->device_lock);
+ 					schedule();
++					do_prepare = true;
+ 					goto retry;
+ 				}
+ 			}
+@@ -4647,6 +4653,7 @@ static void make_request(struct mddev *m
+ 				if (must_retry) {
+ 					release_stripe(sh);
+ 					schedule();
++					do_prepare = true;
+ 					goto retry;
+ 				}
+ 			}
+@@ -4670,8 +4677,10 @@ static void make_request(struct mddev *m
+ 				prepare_to_wait(&conf->wait_for_overlap,
+ 						&w, TASK_INTERRUPTIBLE);
+ 				if (logical_sector >= mddev->suspend_lo &&
+-				    logical_sector < mddev->suspend_hi)
++				    logical_sector < mddev->suspend_hi) {
+ 					schedule();
++					do_prepare = true;
++				}
+ 				goto retry;
+ 			}
+ 
+@@ -4684,9 +4693,9 @@ static void make_request(struct mddev *m
+ 				md_wakeup_thread(mddev->thread);
+ 				release_stripe(sh);
+ 				schedule();
++				do_prepare = true;
+ 				goto retry;
+ 			}
+-			finish_wait(&conf->wait_for_overlap, &w);
+ 			set_bit(STRIPE_HANDLE, &sh->state);
+ 			clear_bit(STRIPE_DELAYED, &sh->state);
+ 			if ((bi->bi_rw & REQ_SYNC) &&
+@@ -4696,10 +4705,10 @@ static void make_request(struct mddev *m
+ 		} else {
+ 			/* cannot get stripe for read-ahead, just give-up */
+ 			clear_bit(BIO_UPTODATE, &bi->bi_flags);
+-			finish_wait(&conf->wait_for_overlap, &w);
+ 			break;
+ 		}
+ 	}
++	finish_wait(&conf->wait_for_overlap, &w);
+ 
+ 	remaining = raid5_dec_bi_active_stripes(bi);
+ 	if (remaining == 0) {

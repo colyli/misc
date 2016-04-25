@@ -1,0 +1,33 @@
+From b46020aa3a8a0f9c7324fe0af4aec4227f947a10 Mon Sep 17 00:00:00 2001
+From: Roman Gushchin <klamm@yandex-team.ru>
+Date: Mon, 21 Dec 2015 10:50:59 +1100
+Subject: [PATCH] md/raid5: remove redundant check in
+ stripe_add_to_batch_list()
+Git-commit: b46020aa3a8a0f9c7324fe0af4aec4227f947a10
+Patch-mainline: v4.5-rc1
+Reference: bsc#953048
+
+The stripe_add_to_batch_list() function is called only if
+stripe_can_batch() returned true, so there is no need for double check.
+
+Signed-off-by: Roman Gushchin <klamm@yandex-team.ru>
+Cc: Neil Brown <neilb@suse.com>
+Cc: linux-raid@vger.kernel.org
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |    2 --
+ 1 file changed, 2 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -767,8 +767,6 @@ static void stripe_add_to_batch_list(str
+ 	int hash;
+ 	int dd_idx;
+ 
+-	if (!stripe_can_batch(sh))
+-		return;
+ 	/* Don't cross chunks, so stripe pd_idx/qd_idx is the same */
+ 	tmp_sec = sh->sector;
+ 	if (!sector_div(tmp_sec, conf->chunk_sectors))

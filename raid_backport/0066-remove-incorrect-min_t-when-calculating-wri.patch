@@ -1,0 +1,55 @@
+From c74c0d760e30f56f9699dc180036ca37993d1c58 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Wed, 15 Jul 2015 17:54:15 +1000
+Subject: [PATCH] md/raid5: remove incorrect "min_t()" when calculating
+ writepos.
+Git-commit: c74c0d760e30f56f9699dc180036ca37993d1c58
+Patch-mainline: v4.3-rc1
+Reference: bsc#953048
+
+This code is calculating:
+  writepos, which is the furthest along address (device-space) that we
+     *will* be writing to
+  readpos, which is the earliest address that we *could* possible read
+     from, and
+  safepos, which is the earliest address in the 'old' section that we
+     might read from after a crash when the reshape position is
+     recovered from metadata.
+
+  The first is a precise calculation, so clipping at zero doesn't
+  make sense.  As the reshape position is now guaranteed to always be
+  a multiple of reshape_sectors and as we already BUG_ON when
+  reshape_progress is zero, there is no point in this min_t() call.
+
+  The readpos and safepos are worst case - actual value depends on
+  precise geometry.  That worst case could be negative, which is only
+  a problem because we are storing the value in an unsigned.
+  So leave the min_t() for those.
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |    7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5350,11 +5350,16 @@ static sector_t reshape_request(struct m
+ 	safepos = conf->reshape_safe;
+ 	sector_div(safepos, data_disks);
+ 	if (mddev->reshape_backwards) {
+-		writepos -= min_t(sector_t, reshape_sectors, writepos);
++		BUG_ON(writepos < reshape_sectors);
++		writepos -= reshape_sectors;
+ 		readpos += reshape_sectors;
+ 		safepos += reshape_sectors;
+ 	} else {
+ 		writepos += reshape_sectors;
++		/* readpos and safepos are worst-case calculations.
++		 * A negative number is overly pessimistic, and causes
++		 * obvious problems for unsigned storage.  So clip to 0.
++		 */
+ 		readpos -= min_t(sector_t, reshape_sectors, readpos);
+ 		safepos -= min_t(sector_t, reshape_sectors, safepos);
+ 	}

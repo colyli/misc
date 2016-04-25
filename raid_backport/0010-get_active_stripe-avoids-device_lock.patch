@@ -1,0 +1,40 @@
+From e240c1839d11152b0355442f8ac6d2d2d921be36 Mon Sep 17 00:00:00 2001
+From: Shaohua Li <shli@kernel.org>
+Date: Wed, 9 Apr 2014 11:27:42 +0800
+Subject: [PATCH] raid5: get_active_stripe avoids device_lock
+Patch-mainline: v3.15-rc1
+Git-commit: e240c1839d11152b0355442f8ac6d2d2d921be36 
+Refernece: bsc#953048
+
+For sequential workload (or request size big workload), get_active_stripe can
+find cached stripe. In this case, we always hold device_lock, which exposes a
+lot of lock contention for such workload. If stripe count isn't 0, we don't
+need hold the lock actually, since we just increase its count. And this is the
+hot code path for such workload. Unfortunately we must delete the BUG_ON.
+
+Signed-off-by: Shaohua Li <shli@fusionio.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+---
+ drivers/md/raid5.c |    9 ++-------
+ 1 file changed, 2 insertions(+), 7 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -683,14 +683,9 @@ get_active_stripe(struct r5conf *conf, s
+ 				init_stripe(sh, sector, previous);
+ 				atomic_inc(&sh->count);
+ 			}
+-		} else {
++		} else if (!atomic_inc_not_zero(&sh->count)) {
+ 			spin_lock(&conf->device_lock);
+-			if (atomic_read(&sh->count)) {
+-				BUG_ON(!list_empty(&sh->lru)
+-				    && !test_bit(STRIPE_EXPANDING, &sh->state)
+-				    && !test_bit(STRIPE_ON_UNPLUG_LIST, &sh->state)
+-					);
+-			} else {
++			if (!atomic_read(&sh->count)) {
+ 				if (!test_bit(STRIPE_HANDLE, &sh->state))
+ 					atomic_inc(&conf->active_stripes);
+ 				BUG_ON(list_empty(&sh->lru));

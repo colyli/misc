@@ -1,0 +1,57 @@
+From 4e3d62ff4976f26d22b8b91572a49136bb3a23f1 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Thu, 21 May 2015 11:50:16 +1000
+Subject: [PATCH] md/raid5: remove condition test from
+ check_break_stripe_batch_list.
+Git-commit: 4e3d62ff4976f26d22b8b91572a49136bb3a23f1
+Patch-mainline: v4.1-rc6
+Reference: bsc#953048
+
+handle_stripe_clean_event() contains a chunk of code very
+similar to check_break_stripe_batch_list().
+If we make the latter more like the former, we can end up
+with just one copy of this code.
+
+This  first step removed the condition (and the 'check_') part
+of the name.  This has the added advantage of making it clear
+what check is being performed at the point where the function is
+called.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |   12 ++++--------
+ 1 file changed, 4 insertions(+), 8 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -4187,16 +4187,11 @@ static int clear_batch_ready(struct stri
+ 	return 0;
+ }
+ 
+-static void check_break_stripe_batch_list(struct stripe_head *sh)
++static void break_stripe_batch_list(struct stripe_head *head_sh)
+ {
+-	struct stripe_head *head_sh, *next;
++	struct stripe_head *sh, *next;
+ 	int i;
+ 
+-	if (!test_and_clear_bit(STRIPE_BATCH_ERR, &sh->state))
+-		return;
+-
+-	head_sh = sh;
+-
+ 	list_for_each_entry_safe(sh, next, &head_sh->batch_list, batch_list) {
+ 
+ 		list_del_init(&sh->batch_list);
+@@ -4243,7 +4238,8 @@ static void handle_stripe(struct stripe_
+ 		return;
+ 	}
+ 
+-	check_break_stripe_batch_list(sh);
++	if (test_and_clear_bit(STRIPE_BATCH_ERR, &sh->state))
++		break_stripe_batch_list(sh);
+ 
+ 	if (test_bit(STRIPE_SYNC_REQUESTED, &sh->state) && !sh->batch_head) {
+ 		spin_lock(&sh->stripe_lock);

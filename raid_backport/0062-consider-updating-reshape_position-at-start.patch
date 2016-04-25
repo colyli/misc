@@ -1,0 +1,73 @@
+From 92140480ed59a006b245efd33a195fde62d1845f Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Mon, 6 Jul 2015 12:28:45 +1000
+Subject: [PATCH] md/raid5: consider updating reshape_position at start of
+ reshape.
+Git-commit: 92140480ed59a006b245efd33a195fde62d1845f
+Patch-mainline: v4.3-rc1
+Reference: bsc#953048
+
+md/raid5 only updates ->reshape_position (which is stored in
+metadata and is authoritative) occasionally, but particularly
+when getting closed to ->resync_max as it must be correct
+when ->resync_max is reached.
+
+When mdadm tries to stop an array which is reshaping it will:
+ - freeze the reshape,
+ - set resync_max to where the reshape has reached.
+ - unfreeze the reshape.
+When this happens, the reshape is aborted and then restarted.
+
+The restart doesn't check that resync_max is close, and so doesn't
+update ->reshape_position like it should.
+This results in the reshape stopping, but ->reshape_position being
+incorrect.
+
+So on that first call to reshape_request, make sure ->reshape_position
+is updated if needed.
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |    8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5309,6 +5309,7 @@ static sector_t reshape_request(struct m
+ 	sector_t stripe_addr;
+ 	int reshape_sectors;
+ 	struct list_head stripes;
++	sector_t retn;
+ 
+ 	if (sector_nr == 0) {
+ 		/* If restarting in the middle, skip the initial sectors */
+@@ -5324,7 +5325,8 @@ static sector_t reshape_request(struct m
+ 			mddev->curr_resync_completed = sector_nr;
+ 			sysfs_notify(&mddev->kobj, NULL, "sync_completed");
+ 			*skipped = 1;
+-			return sector_nr;
++			retn = sector_nr;
++			goto finish;
+ 		}
+ 	}
+ 
+@@ -5497,6 +5499,8 @@ static sector_t reshape_request(struct m
+ 	 * then we need to write out the superblock.
+ 	 */
+ 	sector_nr += reshape_sectors;
++	retn = reshape_sectors;
++finish:
+ 	if ((sector_nr - mddev->curr_resync_completed) * 2
+ 	    >= mddev->resync_max - mddev->curr_resync_completed) {
+ 		/* Cannot proceed until we've updated the superblock... */
+@@ -5522,7 +5526,7 @@ static sector_t reshape_request(struct m
+ 		sysfs_notify(&mddev->kobj, NULL, "sync_completed");
+ 	}
+ ret:
+-	return reshape_sectors;
++	return retn;
+ }
+ 
+ /* FIXME go_faster isn't used */

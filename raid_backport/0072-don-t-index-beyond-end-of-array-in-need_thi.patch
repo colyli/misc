@@ -1,0 +1,43 @@
+From 36707bb2e7c6730d79d6cdc6d1475d3d7e94c518 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Thu, 24 Sep 2015 15:25:36 +1000
+Subject: [PATCH] md/raid5: don't index beyond end of array in
+ need_this_block().
+Git-commit: 36707bb2e7c6730d79d6cdc6d1475d3d7e94c518
+Patch-mainline: v4.3-rc4
+Reference: bsc#953048
+
+When need_this_block probably shouldn't be called when there
+are more than 2 failed devices, we really don't want it to try
+indexing beyond the end of the failed_num[] of fdev[] arrays.
+
+So limit the loops to at most 2 iterations.
+
+Reported-by: Shaohua Li <shli@fb.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/raid5.c |    4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -3255,7 +3255,7 @@ static int need_this_block(struct stripe
+ 		 */
+ 		return 0;
+ 
+-	for (i = 0; i < s->failed; i++) {
++	for (i = 0; i < s->failed && i < 2; i++) {
+ 		if (fdev[i]->towrite &&
+ 		    !test_bit(R5_UPTODATE, &fdev[i]->flags) &&
+ 		    !test_bit(R5_OVERWRITE, &fdev[i]->flags))
+@@ -3279,7 +3279,7 @@ static int need_this_block(struct stripe
+ 	    sh->sector < sh->raid_conf->mddev->recovery_cp)
+ 		/* reconstruct-write isn't being forced */
+ 		return 0;
+-	for (i = 0; i < s->failed; i++) {
++	for (i = 0; i < s->failed && i < 2; i++) {
+ 		if (s->failed_num[i] != sh->pd_idx &&
+ 		    s->failed_num[i] != sh->qd_idx &&
+ 		    !test_bit(R5_UPTODATE, &fdev[i]->flags) &&
