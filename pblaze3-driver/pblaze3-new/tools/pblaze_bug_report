@@ -1,0 +1,263 @@
+#!/bin/bash
+
+# This script is a bug info collecter for memblaze pblaze3 card.
+#set -x
+
+DUMP_THRESHOLD=512000
+
+get_cmd_output()
+{
+	local dir=$1; shift 
+	local file_name=$1; shift
+	local cmd=$@
+
+	${cmd}  > "${dir}/${file_name}" 2>&1
+}
+
+copy_dir()
+{
+	local dir=$1
+	local source=$2
+	cp -r ${source} ${dir}
+}
+
+copy_file()
+{
+	local dir=$1
+	local source=$2
+	cp ${source} ${dir}
+}
+
+collect_package_info()
+{
+	local SUB_DIR=${TMP_DIR}/packages/
+	mkdir ${SUB_DIR}
+
+	echo "Collectiong Packages information..."
+	get_cmd_output ${SUB_DIR} dpkg dpkg -l
+	get_cmd_output ${SUB_DIR} rpm rpm -qa
+}
+
+collect_performance_info()
+{
+	local inter_val=1
+	local count=60
+	local SUB_DIR=${TMP_DIR}/performance/
+	mkdir ${SUB_DIR}
+
+	echo "Collectiong Performance information, may take 5 minitues..."
+	get_cmd_output ${SUB_DIR} ps_aux ps aux
+
+	echo "Collectiong Performance information, 4 minitues left..."
+	get_cmd_output ${SUB_DIR} iostat iostat -x ${inter_val} ${count}
+
+	echo "Collectiong Performance information, 3 minitues left..."
+	get_cmd_output ${SUB_DIR} vmstat vmstat ${inter_val} ${count}
+
+	echo "Collectiong Performance information, 2 minitues left..."
+	get_cmd_output ${SUB_DIR} vmstat top -d ${inter_val} -n ${count} -b
+
+	echo "Collectiong Performance information, 1 minitues left..."
+	get_cmd_output ${SUB_DIR} sar sar ${inter_val} ${count}
+}
+
+collect_storage_info()
+{
+	local SUB_DIR=${TMP_DIR}/storage/
+	local dir=
+	mkdir ${SUB_DIR}
+
+	echo "Collectiong Storage information..."
+	get_cmd_output ${SUB_DIR} pvs pvs
+	get_cmd_output ${SUB_DIR} vgs vgs
+	get_cmd_output ${SUB_DIR} lvs lvs
+
+	for dir in `find /sys/block/ -maxdepth 1 -name "memdisk*"`
+	do
+		copy_file ${SUB_DIR}/`basename ${dir}_scheduler` ${dir}/queue/scheduler
+	done
+}
+
+collect_logs()
+{
+	local SUB_DIR=${TMP_DIR}/logs/
+	local file=
+	mkdir ${SUB_DIR}
+
+	echo "Collectiong Logs information..."
+	get_cmd_output ${SUB_DIR} dmesg_current dmesg
+
+	for file in `ls /var/log/dmesg*`
+	do
+		copy_file ${SUB_DIR} ${file}
+	done
+
+	for file in `ls /var/log/messages*`
+	do
+		copy_file ${SUB_DIR} ${file}
+	done
+
+	for file in `ls /var/log/*.log`
+	do
+		copy_file ${SUB_DIR} ${file}
+	done
+}
+
+check_coredump_size()
+{
+	core_dump=$1
+	size=`du -s ${core_dump} | awk '//{print $1}'`
+	if [[ ${size} -gt ${DUMP_THRESHOLD} ]]; then
+		return 1
+	fi
+	return 0
+}
+
+collect_panic_info()
+{
+	local SUB_DIR=${TMP_DIR}/dumps/
+	local dump=
+	mkdir ${SUB_DIR}
+
+	local kdump_path=`grep "^path\ " /etc/kdump.conf | awk '{print $2}'`
+	if [ -z $kdump_path ];
+	then
+		kdump_path=/var/crash
+	fi
+
+	echo "Collectiong dump information..."
+	dump=$(ls -lrt ${kdump_path} | tail -n 1 | awk '{print $9}')
+
+	check_coredump_size ${kdump_path}/${dump}
+	if [[ $? -eq 0 ]]; then
+		copy_dir ${SUB_DIR} ${kdump_path}/${dump}
+	else
+		echo "Core dump file too large, please pack it separately!"
+		return
+	fi
+	
+	symbol=/lib/modules/`uname -r`/build/vmlinux
+	if [[ -e ${symbol} ]]; then
+		copy_file ${SUB_DIR} ${symbol}
+	fi
+
+	symbol=/usr/lib/debug/lib/modules/`uname -r`/vmlinux
+	if [[ -e ${symbol} ]]; then
+		copy_file ${SUB_DIR} 
+	fi
+}
+
+collect_memblaze_info()
+{
+	local SUB_DIR=${TMP_DIR}/memblaze/
+	mkdir ${SUB_DIR}
+
+	echo "Collectiong memblaze information..."
+	get_cmd_output ${SUB_DIR} memmonitor memmonitor -l
+}
+
+collect_proc_memcon_info()
+{
+	local SUB_DIR=$1
+	local dir=
+
+	mkdir ${SUB_DIR}/memcon_1
+	mkdir ${SUB_DIR}/memcon_2
+
+	for dir in `find /proc -maxdepth 1 -name "memcon*"`
+	do
+		copy_dir ${SUB_DIR}/memcon_1 ${dir}
+		copy_dir ${SUB_DIR}/memcon_2 ${dir}
+	done
+}
+
+collect_proc_memdisk_info()
+{
+	local SUB_DIR=$1
+	local dir=
+
+	mkdir ${SUB_DIR}/memdisk
+
+	for dir in `find /proc -maxdepth 1 -name "memdisk*"`
+	do
+		copy_dir ${SUB_DIR}/memdisk ${dir}
+	done
+}
+
+collect_proc_info()
+{
+	local SUB_DIR=${TMP_DIR}/proc
+
+	mkdir ${SUB_DIR}
+
+	echo "Collectiong proc information..."
+	collect_proc_memcon_info ${SUB_DIR}
+	collect_proc_memdisk_info ${SUB_DIR}
+
+	copy_file ${SUB_DIR} /proc/cpuinfo
+	copy_file ${SUB_DIR} /proc/meminfo
+	copy_file ${SUB_DIR} /proc/interrupts
+}
+
+collect_modules_info()
+{
+	local SUB_DIR=${TMP_DIR}/modules/
+	mkdir ${SUB_DIR}
+
+	echo "Collectiong Modules information..."
+	get_cmd_output ${SUB_DIR} lsmod lsmod
+	get_cmd_output ${SUB_DIR} lib_modules find /lib/modules/$(uname -r)
+}
+
+collect_system_info()
+{
+	local SUB_DIR=${TMP_DIR}/system/
+	mkdir ${SUB_DIR}
+
+	echo "Collectiong system information..."
+	get_cmd_output ${SUB_DIR} uname_a uname -a
+	get_cmd_output ${SUB_DIR} lsb_release lsb_release -a
+	get_cmd_output ${SUB_DIR} lspci lspci
+	get_cmd_output ${SUB_DIR} lspci_vvvvv lspci -vvvvv 
+	get_cmd_output ${SUB_DIR} lspci_tv lspci -tv
+	get_cmd_output ${SUB_DIR} lspci_n lspci -n
+	get_cmd_output ${SUB_DIR} df_T df -T
+
+	copy_file ${SUB_DIR} /etc/fstab
+}
+
+function add_sn_to_name()
+{
+
+	local output=`memmonitor -l | awk -F = '/SerialNumber/{print $2}'`
+	for card in ${output};
+	do
+		TMP_NAME=${TMP_NAME}_${card}
+	done
+}
+
+TMP_PATH=/home
+TMP_NAME=bugreport_`date +%Y%m%d%H%M%S`
+
+add_sn_to_name
+
+TMP_DIR=${TMP_PATH}/${TMP_NAME}
+
+echo "Create a bug info collect dir under dir ${TMP_PATH}"
+mkdir ${TMP_DIR}
+
+collect_system_info
+collect_modules_info
+collect_package_info
+collect_storage_info
+collect_logs
+collect_memblaze_info
+collect_proc_info
+collect_panic_info
+collect_performance_info
+
+tar -cjf ${TMP_DIR}.tar.bz2 -C ${TMP_PATH} ${TMP_NAME}
+rm -rf ${TMP_DIR}
+
+echo "Collecting Done. ${TMP_DIR}.tar.bz2 generated!"
+

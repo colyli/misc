@@ -1,0 +1,90 @@
+#!/bin/bash
+processors=(`cat /proc/cpuinfo | awk '/processor/{print $3}'`)
+cores=(`cat /proc/cpuinfo | awk '/core id/{print $4}'`)
+sockets=(`cat /proc/cpuinfo | awk '/physical id/{print $4}'`)
+
+pci_addr=(`lspci -D | grep "Mass storage controller: Device"| awk '{print $1}'`)
+if [[ ${#pci_addr[@]} -eq 0 ]]
+then
+	echo "Can't find pblaze device."
+	exit
+fi
+
+numa_node=`cat /sys/bus/pci/devices/${pci_addr}/numa_node`
+if [[ ${numa_node} -eq -1 ]]
+then
+	let numa_node=0
+fi
+
+function find_processor()
+{
+	local socket_id=$1
+	local core_id=$2
+	for ((i=0;i<${#sockets[@]};i++))
+	do
+		if [[ ${sockets[$i]} -eq ${socket_id} && ${cores[$i]} -eq ${core_id} ]]
+		then
+			return ${processors[$i]}
+		fi
+	done
+}
+
+bind_interrupt()
+{
+	irq=(`cat /proc/interrupts | grep memcon| awk -F : '{print $1}'`)
+	total=${#irq[@]}
+	if [[ ${total} -eq 0 ]]
+	then
+		echo "Can't find memcon interrupts, exit."
+		return
+	fi
+
+	find_processor ${numa_node} 0
+	processor=$?
+
+	half=`expr ${total} / 2`
+	let "flag=1<<${processor}"
+	let flag=`echo "obase=16;${flag}"|bc`
+	for i in `seq 0 ${half}`
+	do
+		echo ${flag} > /proc/irq/${irq[$i]}/smp_affinity
+	done
+	
+	find_processor ${numa_node} 1
+	processor=$?
+
+	let half=${halft}+1
+	let total=${total}-1
+	let "flag=1<<${processor}"
+	let flag=`echo "obase=16;${flag}"|bc`
+
+	for i in `seq ${half} ${total}`
+	do
+		echo ${flag} > /proc/irq/${irq[$i]}/smp_affinity
+	done
+}
+
+bind_kernel_thread()
+{
+	threads=(`ps aux | grep "\[pb"| awk '{print $2}'`)
+	let total=${#threads[@]}-1
+	if [[ ${total} -eq 0 ]]
+	then
+		echo "Can't find memcon threads, exit."
+		return
+	fi
+
+	find_processor ${numa_node} 2
+	processor=$?
+	
+	let total=${total}-1
+	for i in `seq 0 ${total}`
+	do
+		taskset -pc ${processor} ${threads[$i]}
+	done
+}
+
+/etc/init.d/irqbalance stop
+bind_interrupt ${numa_node}
+bind_kernel_thread ${numa_node}
+
