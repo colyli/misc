@@ -1,7 +1,7 @@
 #!/bin/sh -x
 
 linux_path=~/source/linux/linux
-reference="bsc#953048"
+reference="fate#320291"
 
 for p in `cat patchlist`;do
 	./scripts/patch-tags-from-git $p $linux_path
