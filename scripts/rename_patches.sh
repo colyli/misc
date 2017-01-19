@@ -1,3 +1,23 @@
 #!/bin/bash
 
-nr=1;for f in `cat namelist`;do n=`printf %.4d $nr`;echo $n;nr=`expr $nr + 1`;name=`echo $f| sed "s/^.*[0-9]-/$n-/"`;cp $f tmp/$name;done
+if [ $# != 1 ];then
+	echo "usage: $0 name-list"
+	echo "   name-list is a patch name list without ID"
+	exit 0
+fi
+
+list=$1
+
+nr=1
+for p in `cat $list`;do
+	f=`ls *"$p"*`
+	if [ $? != 0 ];then
+		echo "$p does not exist"
+		continue
+	fi
+
+	id=`printf %.4d $nr`
+	nr=`expr $nr + 1`
+	name=$id"-"$p
+	mv $f $name
+done
