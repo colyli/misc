@@ -9,8 +9,8 @@ for branch in $submit_branches;do
 	git merge-base --is-ancestor $branch $product_branch
 	ret=$?
 	if [ $ret == 0 ] ;then
-		echo "merged: $branch is merged into $product_branch"
+		echo -e "merged:\n $branch is merged into $product_branch"
 	else
-		echo "NOT merged: $branch is NOT merged into $product_branch"
+		echo -e "NOT merged:\n $branch is NOT merged into $product_branch"
 	fi
 done
