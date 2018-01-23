@@ -32,7 +32,7 @@ fi
 while read line
 do
 	# visible
-#	echo $line | md5sum | sed "s/  -//" | tee $out_file
+#	echo -en $line | md5sum | sed "s/  -//" | tee $out_file
 	# faster
 	echo -en $line | md5sum | sed "s/  -//" >> $out_file
 done < $in_file
