@@ -1,7 +1,7 @@
-#!/bin/bash
+#!/bin/bash -x
 
-if [ $# != 1 ];then
-	echo "usage: $0 name-list"
+if [ $# -lt 1 ] || [ $# -gt 2 ];then
+	echo "usage: $0 name-list <start_id>"
 	echo "   name-list is a patch name list without ID"
 	exit 0
 fi
@@ -9,9 +9,13 @@ fi
 list=$1
 
 nr=1
+if [ $# == 2 ];then
+	nr=$2
+fi
 for p in `cat $list`;do
+	f=$p
 	p=`echo $p|sed "s/^[0-9]\{4\}-//"`
-	f=`ls *"$p"*`
+	ls *"$p"*
 	if [ $? != 0 ];then
 		echo "$p does not exist"
 		continue
